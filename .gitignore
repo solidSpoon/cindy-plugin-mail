@@ -1,5 +1,7 @@
 # Binaries
-mail-app-cli
+# anchored: the binary is built at the repo root, and a bare "mail-app-cli"
+# would also ignore skill/mail-app-cli/ (gitignore matches any path segment).
+/mail-app-cli
 *.exe
 *.exe~
 *.dll

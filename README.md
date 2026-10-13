@@ -272,6 +272,20 @@ mail-app-cli '{"action":"open",
                                     "in":{"account":"Google","mailbox":"All Mail"}}}}'
 ```
 
+## Agent skill
+
+The agent-facing instructions for this tool live in the repo at
+[`skill/mail-app-cli/SKILL.md`](skill/mail-app-cli/SKILL.md). They are maintained
+here and copied into the agent's global skills directory, so the repo stays the
+source of truth:
+
+```bash
+rsync -a --delete skill/mail-app-cli/ ~/.agents/skills/mail-app-cli/
+```
+
+(`~/.agents/skills/` is Pi's global skill location; a folder there whose name
+matches the skill's `name` is enough for it to be discovered.)
+
 ## How it works
 
 Mail.app is driven through `osascript` (JavaScript for Automation and
