@@ -93,31 +93,6 @@ func (c *Cache) Set(key string, v any) error {
 	return nil
 }
 
-// Delete removes a cached item
-func (c *Cache) Delete(key string) error {
-	path := filepath.Join(c.dir, key+".json")
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to delete cache file: %w", err)
-	}
-	return nil
-}
-
-// Clear removes all cached items
-func (c *Cache) Clear() error {
-	files, err := filepath.Glob(filepath.Join(c.dir, "*.json"))
-	if err != nil {
-		return fmt.Errorf("failed to list cache files: %w", err)
-	}
-
-	for _, file := range files {
-		if err := os.Remove(file); err != nil {
-			return fmt.Errorf("failed to delete cache file %s: %w", file, err)
-		}
-	}
-
-	return nil
-}
-
 // DeletePrefix removes all cached items whose key starts with the given prefix.
 // Use this to invalidate all query variants for a specific mailbox after a mutation.
 func (c *Cache) DeletePrefix(prefix string) error {

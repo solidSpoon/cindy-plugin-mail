@@ -116,7 +116,6 @@ type Attachment struct {
 	MimeType string
 }
 
-// GetAccounts retrieves all Mail.app accounts
 // jsResolveMailbox defines a JXA helper that resolves a mailbox by walking
 // the account's mailbox tree. byName() specifiers are broken for Gmail
 // special mailboxes like "All Mail" ("Can't get object"), so scripts must
@@ -195,171 +194,6 @@ function parseThreadHeaders(headers) {
 	return { inReplyTo: inReplyTo, references: references };
 }
 `
-
-func (c *Client) GetAccounts() ([]Account, error) {
-	script := `
-	tell application "Mail"
-		set accountList to {}
-		repeat with acc in accounts
-			set accountInfo to {id:id of acc, name:name of acc, emailAddress:(try
-				(email addresses of acc)
-			on error
-				""
-			end try), accountType:(try
-				(delivery account of acc) as string
-			on error
-				"unknown"
-			end try), userName:user name of acc, enabled:enabled of acc}
-			set end of accountList to accountInfo
-		end repeat
-		return accountList
-	end tell
-`
-	output, err := c.runAppleScript(script)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse AppleScript list output
-	accounts, err := c.parseAccounts(output)
-	return accounts, err
-}
-
-// GetMailboxes retrieves all mailboxes for a specific account
-func (c *Client) GetMailboxes(accountName string) ([]Mailbox, error) {
-	script := fmt.Sprintf(`
-	tell application "Mail"
-		set mailboxList to {}
-		try
-			set targetAccount to account "%s"
-			repeat with mbox in mailboxes of targetAccount
-				set mailboxInfo to {name:(name of mbox), unreadCount:(unread count of mbox), totalCount:(count of messages in mbox), account:(name of targetAccount)}
-				set end of mailboxList to mailboxInfo
-			end repeat
-		end try
-		return mailboxList
-	end tell
-`, escapeAppleScriptString(accountName))
-
-	output, err := c.runAppleScript(script)
-	if err != nil {
-		return nil, err
-	}
-
-	mailboxes, err := c.parseMailboxes(output)
-	return mailboxes, err
-}
-
-// GetAllMailboxes retrieves all mailboxes across all accounts
-func (c *Client) GetAllMailboxes() ([]Mailbox, error) {
-	script := `
-	tell application "Mail"
-		set mailboxList to {}
-		repeat with acc in accounts
-			repeat with mbox in mailboxes of acc
-				set mailboxInfo to {name:(name of mbox), unreadCount:(unread count of mbox), totalCount:(count of messages in mbox), account:(name of acc)}
-				set end of mailboxList to mailboxInfo
-			end repeat
-		end repeat
-		return mailboxList
-	end tell
-`
-	output, err := c.runAppleScript(script)
-	if err != nil {
-		return nil, err
-	}
-
-	mailboxes, err := c.parseMailboxes(output)
-	return mailboxes, err
-}
-
-// GetMessages retrieves messages from a mailbox
-func (c *Client) GetMessages(accountName, mailboxName string, limit int) ([]Message, error) {
-	limitClause := ""
-	if limit > 0 {
-		limitClause = fmt.Sprintf("if msgCount > %d then set msgCount to %d", limit, limit)
-	}
-
-	script := fmt.Sprintf(`
-	tell application "Mail"
-		set messageList to {}
-		try
-			set targetAccount to account "%s"
-			set targetMailbox to mailbox "%s" of targetAccount
-			set msgCount to count of messages in targetMailbox
-			%s
-
-			repeat with i from 1 to msgCount
-				set msg to message i of targetMailbox
-				set msgInfo to {subject:(subject of msg), sender:(sender of msg), dateSent:(date sent of msg as string), dateReceived:(date received of msg as string), isRead:(read status of msg), isFlagged:(flagged status of msg), messageSize:(message size of msg)}
-				set end of messageList to msgInfo
-			end repeat
-		end try
-		return messageList
-	end tell
-`, escapeAppleScriptString(accountName), escapeAppleScriptString(mailboxName), limitClause)
-
-	output, err := c.runAppleScript(script)
-	if err != nil {
-		return nil, err
-	}
-
-	messages, err := c.parseMessages(output)
-	return messages, err
-}
-
-// SearchMessages searches for messages matching a query
-func (c *Client) SearchMessages(query string, limit int) ([]Message, error) {
-	limitClause := ""
-	if limit > 0 {
-		limitClause = fmt.Sprintf("if msgCount > %d then set msgCount to %d", limit, limit)
-	}
-
-	// query is injected into AppleScript double quotes, needs escaping
-	script := fmt.Sprintf(`
-	tell application "Mail"
-		set messageList to {}
-		set foundMessages to (every message whose subject contains "%s" or sender contains "%s" or content contains "%s")
-		set msgCount to count of foundMessages
-		%s
-
-		repeat with i from 1 to msgCount
-			set msg to item i of foundMessages
-			try
-				set msgInfo to {subject:(subject of msg), sender:(sender of msg), dateSent:(date sent of msg as string), dateReceived:(date received of msg as string), isRead:(read status of msg), isFlagged:(flagged status of msg), messageSize:(message size of msg)}
-				set end of messageList to msgInfo
-			end try
-		end repeat
-		return messageList
-	end tell
-`, escapeAppleScriptString(query), escapeAppleScriptString(query), escapeAppleScriptString(query), limitClause)
-
-	output, err := c.runAppleScript(script)
-	if err != nil {
-		return nil, err
-	}
-
-	messages, err := c.parseMessages(output)
-	return messages, err
-}
-
-// MarkMessageAsRead marks a message as read
-func (c *Client) MarkMessageAsRead(accountName, mailboxName, messageID string, read bool) error {
-	res, err := c.MarkMessages(accountName, mailboxName, []string{messageID}, read)
-	if err != nil {
-		return err
-	}
-	return res.Err()
-}
-
-// FlagMessage sets or unsets the flagged status of a message
-func (c *Client) FlagMessage(accountName, mailboxName, messageID string, flagged bool) error {
-	res, err := c.FlagMessages(accountName, mailboxName, []string{messageID}, flagged)
-	if err != nil {
-		return err
-	}
-	return res.Err()
-}
 
 // DefaultQuarantineMailbox is the holding mailbox used by `messages
 // quarantine`. Messages are *moved* here, never deleted, so the operation stays
@@ -613,47 +447,6 @@ const mail = Application('Mail');
 	sort.Strings(res.Complete)
 	sort.Strings(res.Strays)
 	return res, nil
-}
-
-// Helper function to parse accounts from AppleScript output
-func (c *Client) parseAccounts(_ string) ([]Account, error) {
-	// TODO: Implement proper parsing based on AppleScript record format
-	return []Account{}, nil
-}
-
-// Helper function to parse mailboxes from AppleScript output
-func (c *Client) parseMailboxes(_ string) ([]Mailbox, error) {
-	// TODO: Implement proper parsing based on AppleScript record format
-	return []Mailbox{}, nil
-}
-
-// Helper function to parse messages from AppleScript output
-func (c *Client) parseMessages(_ string) ([]Message, error) {
-	// TODO: Implement proper parsing based on AppleScript record format
-	return []Message{}, nil
-}
-
-// GetUnreadCount gets the total unread message count
-func (c *Client) GetUnreadCount() (int, error) {
-	script := `
-	tell application "Mail"
-		set totalUnread to 0
-		repeat with acc in accounts
-			repeat with mbox in mailboxes of acc
-				set totalUnread to totalUnread + (unread count of mbox)
-			end repeat
-		end repeat
-		return totalUnread
-	end tell
-`
-	output, err := c.runAppleScript(script)
-	if err != nil {
-		return 0, err
-	}
-
-	var count int
-	fmt.Sscanf(output, "%d", &count)
-	return count, nil
 }
 
 // GetAccountsJSON retrieves accounts as JSON using JXA
@@ -1103,42 +896,6 @@ JSON.stringify(result);
 	return &message, nil
 }
 
-// ArchiveMessage moves a message to the provider's archive mailbox.
-//
-// Gmail accounts (detected by the presence of an "All Mail" mailbox) are
-// refused: Mail.app offers no safe, scriptable archive for Gmail. Every
-// mechanism was tested and fails:
-//   - Scripted moves out of INBOX (mailbox property or the move command)
-//     behave as label copies on Gmail's IMAP bridge — the message reappears
-//     in the inbox on the next sync.
-//   - Moving through Trash (move to Trash, then move back out to All Mail)
-//     does archive, but races Gmail's "expunged from Trash = permanently
-//     deleted" rule and was observed to permanently delete messages.
-//   - message.deletedStatus is read-only.
-//   - Driving Mail's own Archive command works reliably but requires UI
-//     automation that activates Mail and steals focus.
-//
-// Archiving Gmail from the CLI therefore needs the Gmail API, not Mail.app.
-//
-// Other providers (Exchange, Fastmail, ...) do real moves, so a plain move
-// to their "Archive" mailbox works.
-func (c *Client) ArchiveMessage(accountName, mailboxName, messageID string) error {
-	res, err := c.ArchiveMessages(accountName, mailboxName, []string{messageID})
-	if err != nil {
-		return err
-	}
-	return res.Err()
-}
-
-// MoveMessage moves a message to a different mailbox
-func (c *Client) MoveMessage(accountName, sourceMailbox, messageID, targetMailbox string) error {
-	res, err := c.MoveMessages(accountName, sourceMailbox, []string{messageID}, targetMailbox)
-	if err != nil {
-		return err
-	}
-	return res.Err()
-}
-
 // GetAttachmentsJSON retrieves attachments from a message
 func (c *Client) GetAttachmentsJSON(accountName, mailboxName, messageID string) ([]Attachment, error) {
 	script := fmt.Sprintf(`
@@ -1450,209 +1207,6 @@ func (c *Client) GetMessagesFromMultipleMailboxes(requests []struct {
 	return allMessages, nil
 }
 
-// GetMultipleMessageDetails loads full details for multiple messages concurrently
-func (c *Client) GetMultipleMessageDetails(requests []struct {
-	AccountName string
-	MailboxName string
-	MessageID   string
-}) ([]*Message, error) {
-	if len(requests) == 0 {
-		return []*Message{}, nil
-	}
-
-	// If only one request, no need for parallelization
-	if len(requests) == 1 {
-		req := requests[0]
-		msg, err := c.GetMessageDetailsJSON(req.AccountName, req.MailboxName, req.MessageID)
-		if err != nil {
-			return nil, err
-		}
-		return []*Message{msg}, nil
-	}
-
-	// Load message details in parallel
-	type result struct {
-		message *Message
-		err     error
-		index   int
-	}
-	results := make(chan result, len(requests))
-
-	// Launch goroutine for each message
-	for i, req := range requests {
-		go func(idx int, r struct {
-			AccountName string
-			MailboxName string
-			MessageID   string
-		}) {
-			message, err := c.GetMessageDetailsJSON(r.AccountName, r.MailboxName, r.MessageID)
-			results <- result{message: message, err: err, index: idx}
-		}(i, req)
-	}
-
-	// Collect results in original order
-	messages := make([]*Message, len(requests))
-	var errors []error
-	successCount := 0
-
-	for i := 0; i < len(requests); i++ {
-		res := <-results
-		if res.err != nil {
-			errors = append(errors, res.err)
-			messages[res.index] = nil
-		} else {
-			messages[res.index] = res.message
-			successCount++
-		}
-	}
-
-	// Return error if all requests failed
-	if successCount == 0 {
-		return nil, fmt.Errorf("failed to get all message details: %v", errors)
-	}
-
-	return messages, nil
-}
-
-// BulkMarkMessages marks multiple messages as read/unread concurrently
-func (c *Client) BulkMarkMessages(requests []struct {
-	AccountName string
-	MailboxName string
-	MessageID   string
-	Read        bool
-}) error {
-	if len(requests) == 0 {
-		return nil
-	}
-
-	// If only one request, no need for parallelization
-	if len(requests) == 1 {
-		req := requests[0]
-		return c.MarkMessageAsRead(req.AccountName, req.MailboxName, req.MessageID, req.Read)
-	}
-
-	// Process marks in parallel
-	errors := make(chan error, len(requests))
-
-	// Launch goroutine for each mark operation
-	for _, req := range requests {
-		go func(r struct {
-			AccountName string
-			MailboxName string
-			MessageID   string
-			Read        bool
-		}) {
-			errors <- c.MarkMessageAsRead(r.AccountName, r.MailboxName, r.MessageID, r.Read)
-		}(req)
-	}
-
-	// Collect results
-	var errorList []error
-	for i := 0; i < len(requests); i++ {
-		if err := <-errors; err != nil {
-			errorList = append(errorList, err)
-		}
-	}
-
-	if len(errorList) > 0 {
-		return fmt.Errorf("failed to mark some messages: %v", errorList)
-	}
-
-	return nil
-}
-
-// BulkFlagMessages flags/unflags multiple messages concurrently
-func (c *Client) BulkFlagMessages(requests []struct {
-	AccountName string
-	MailboxName string
-	MessageID   string
-	Flagged     bool
-}) error {
-	if len(requests) == 0 {
-		return nil
-	}
-
-	// If only one request, no need for parallelization
-	if len(requests) == 1 {
-		req := requests[0]
-		return c.FlagMessage(req.AccountName, req.MailboxName, req.MessageID, req.Flagged)
-	}
-
-	// Process flags in parallel
-	errors := make(chan error, len(requests))
-
-	// Launch goroutine for each flag operation
-	for _, req := range requests {
-		go func(r struct {
-			AccountName string
-			MailboxName string
-			MessageID   string
-			Flagged     bool
-		}) {
-			errors <- c.FlagMessage(r.AccountName, r.MailboxName, r.MessageID, r.Flagged)
-		}(req)
-	}
-
-	// Collect results
-	var errorList []error
-	for i := 0; i < len(requests); i++ {
-		if err := <-errors; err != nil {
-			errorList = append(errorList, err)
-		}
-	}
-
-	if len(errorList) > 0 {
-		return fmt.Errorf("failed to flag some messages: %v", errorList)
-	}
-
-	return nil
-}
-
-// BulkArchiveMessages archives multiple messages concurrently
-func (c *Client) BulkArchiveMessages(requests []struct {
-	AccountName string
-	MailboxName string
-	MessageID   string
-}) error {
-	if len(requests) == 0 {
-		return nil
-	}
-
-	// If only one request, no need for parallelization
-	if len(requests) == 1 {
-		req := requests[0]
-		return c.ArchiveMessage(req.AccountName, req.MailboxName, req.MessageID)
-	}
-
-	// Process archives in parallel
-	errors := make(chan error, len(requests))
-
-	// Launch goroutine for each archive operation
-	for _, req := range requests {
-		go func(r struct {
-			AccountName string
-			MailboxName string
-			MessageID   string
-		}) {
-			errors <- c.ArchiveMessage(r.AccountName, r.MailboxName, r.MessageID)
-		}(req)
-	}
-
-	// Collect results
-	var errorList []error
-	for i := 0; i < len(requests); i++ {
-		if err := <-errors; err != nil {
-			errorList = append(errorList, err)
-		}
-	}
-
-	if len(errorList) > 0 {
-		return fmt.Errorf("failed to archive some messages: %v", errorList)
-	}
-
-	return nil
-}
-
 // BulkMoveMessages moves multiple messages concurrently
 // GetUnifiedMessagesJSON retrieves messages from Mail.app's special unified
 // mailboxes (inboxes, sentMailboxes, draftMailboxes, trashMailboxes,
@@ -1851,52 +1405,6 @@ func sortAndSlice(messages []Message, offset, limit int) []Message {
 	return messages
 }
 
-func (c *Client) BulkMoveMessages(requests []struct {
-	AccountName   string
-	SourceMailbox string
-	MessageID     string
-	TargetMailbox string
-}) error {
-	if len(requests) == 0 {
-		return nil
-	}
-
-	// If only one request, no need for parallelization
-	if len(requests) == 1 {
-		req := requests[0]
-		return c.MoveMessage(req.AccountName, req.SourceMailbox, req.MessageID, req.TargetMailbox)
-	}
-
-	// Process moves in parallel
-	errors := make(chan error, len(requests))
-
-	// Launch goroutine for each move operation
-	for _, req := range requests {
-		go func(r struct {
-			AccountName   string
-			SourceMailbox string
-			MessageID     string
-			TargetMailbox string
-		}) {
-			errors <- c.MoveMessage(r.AccountName, r.SourceMailbox, r.MessageID, r.TargetMailbox)
-		}(req)
-	}
-
-	// Collect results
-	var errorList []error
-	for i := 0; i < len(requests); i++ {
-		if err := <-errors; err != nil {
-			errorList = append(errorList, err)
-		}
-	}
-
-	if len(errorList) > 0 {
-		return fmt.Errorf("failed to move some messages: %v", errorList)
-	}
-
-	return nil
-}
-
 // MutationResult reports the per-message outcome of a batch mutation.
 type MutationResult struct {
 	Succeeded []string          `json:"succeeded"`
@@ -2001,8 +1509,27 @@ func (c *Client) MoveMessages(accountName, sourceMailbox string, messageIDs []st
 	return c.mutateMessages(accountName, sourceMailbox, messageIDs, prelude, "mail.move(msg, { to: destMbox });")
 }
 
-// ArchiveMessages archives several messages in one round trip. See
-// ArchiveMessage for why Gmail accounts are refused.
+// ArchiveMessages moves messages to the provider's archive mailbox.
+//
+// Gmail accounts (detected by the presence of an "All Mail" mailbox) are
+// refused: Mail.app offers no safe, scriptable archive for Gmail. Every
+// mechanism was tested and fails:
+//   - Scripted moves out of INBOX (mailbox property or the move command)
+//     behave as label copies on Gmail's IMAP bridge — the message reappears
+//     in the inbox on the next sync.
+//   - Moving through Trash (move to Trash, then move back out to All Mail)
+//     does archive, but races Gmail's "expunged from Trash = permanently
+//     deleted" rule and was observed to permanently delete messages.
+//   - message.deletedStatus is read-only.
+//   - Driving Mail's own Archive command works reliably but requires UI
+//     automation that activates Mail and steals focus.
+//
+// Archiving Gmail from the CLI therefore needs the Gmail API, not Mail.app.
+//
+// Other providers (Exchange, Fastmail, ...) do real moves, so a plain move
+// to their "Archive" mailbox works.
+//
+// All messages are processed in one Mail.app round trip.
 func (c *Client) ArchiveMessages(accountName, mailboxName string, messageIDs []string) (*MutationResult, error) {
 	prelude := `if (resolveMailbox(acc, 'All Mail')) throw 'Gmail accounts cannot be archived safely via Mail.app scripting. ' +
 		'Archive it in Mail.app or Gmail directly, or use "messages quarantine" to park it in a holding mailbox.';
@@ -2296,7 +1823,7 @@ func (s *GlobalSummary) Err() error {
 // missing), "move" (target is the destination mailbox name within each
 // message's own account) or "archive". For archive, gmailPolicy decides what
 // happens to messages in Gmail accounts (which cannot be archived safely via
-// scripting, see ArchiveMessage): "skip" (default) or "read" (just mark read).
+// scripting, see ArchiveMessages): "skip" (default) or "read" (just mark read).
 //
 // There is deliberately no "delete" action.
 func (c *Client) MutateMessagesGlobal(messageIDs []string, action, target, gmailPolicy string) (*GlobalSummary, error) {
