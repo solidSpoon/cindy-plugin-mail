@@ -173,6 +173,12 @@ func runGlobal(ids []string, action, target, verb string) error {
 	if err != nil {
 		return fmt.Errorf("failed to %s messages: %w", action, err)
 	}
+	return reportGlobal(summary, verb)
+}
+
+// reportGlobal prints a global mutation summary (JSON on stdout, one-line
+// summary on stderr) and invalidates the caches of every account it touched.
+func reportGlobal(summary *mail.GlobalSummary, verb string) error {
 	touched := map[string]bool{}
 	for _, r := range summary.Results {
 		if r.Account != "" && !touched[r.Account] {
@@ -292,7 +298,13 @@ quit"), so Trash is not a safe holding area.` + globalHelp,
 			box = mail.DefaultQuarantineMailbox
 		}
 		if !scoped {
-			return runGlobal(args, "quarantine", box, "quarantined in "+box)
+			// QuarantineMessages creates the holding mailbox (in its own osascript
+			// process) before moving anything, so it cannot go through runGlobal.
+			summary, err := mail.NewClient().QuarantineMessages(box, args)
+			if err != nil {
+				return fmt.Errorf("failed to quarantine messages: %w", err)
+			}
+			return reportGlobal(summary, "quarantined in "+box)
 		}
 		res, err := mail.NewClient().QuarantineMessagesIn(msgAccount, msgMailbox, box, args)
 		if err != nil {
