@@ -1,574 +1,278 @@
-# mail-app-cli
-
-**An [Intelligrit Labs](https://intelligrit.com#labs) Project**
-
 <p align="center">
   <img src="logo.png" alt="mail-app-cli logo" width="200">
 </p>
 
-A command-line interface for controlling macOS Mail.app. Provides complete scriptable access to accounts, mailboxes, messages, and attachments.
+# mail-app-cli
 
-## Features
+**An [Intelligrit Labs](https://intelligrit.com#labs) Project**
 
-- List and manage Mail.app accounts
-- Browse and manage mailboxes
-- List, read, search, and manage messages
-- Archive, move, quarantine, flag, and mark messages
-- Compose drafts for you to review and send yourself (the CLI cannot send)
-- Manage attachments
-- Fully scriptable - perfect for automation and building GUIs
-
-## Installation
-
-### From Source
+A JSON-driven interface to macOS Mail.app. One request document in, one result
+envelope out — accounts, mailboxes, messages, attachments and drafts, scriptable
+from any language that can spawn a process and write JSON.
 
 ```bash
-go install github.com/intelligrit/mail-app-cli@latest
+mail-app-cli '{"action":"messages.unified","box":"unread","limit":5,"format":"compact"}'
 ```
 
-### Build Locally
+## Two invariants
+
+The tool is built so that the dangerous things are not possible, not merely
+discouraged. Both are reported by the `schema` action at runtime.
+
+- **It cannot send mail.** `draft` composes a message into Mail.app's Drafts
+  mailbox and stops there; you review it and press Send in Mail.app.
+- **It cannot delete mail.** There is no delete action. `messages.quarantine`
+  moves messages into a holding mailbox (default `待删除`, created per account on
+  demand), which stays visible and reversible from Mail.app.
+
+Every mutation also accepts `"dryRun": true`, which reports exactly what it
+would touch and changes nothing.
+
+## Install
 
 ```bash
-git clone https://github.com/intelligrit/mail-app-cli.git
-cd mail-app-cli
-go build -o mail-app-cli
+go build -o mail-app-cli .     # or: make build / go install
 ```
 
-## Usage
+Requires macOS with Mail.app configured. The first run asks for permission to
+control Mail.app (System Settings → Privacy & Security → Automation).
 
-### Accounts
+## The protocol
 
-List all Mail.app accounts:
+Input is a single JSON document, passed as the first argument or on stdin. It is
+either one operation or a batch:
 
 ```bash
-mail-app-cli accounts list
+# one operation
+mail-app-cli '{"action":"accounts.list"}'
+
+# a batch: every operation runs, and one failure does not stop the others
+mail-app-cli <<'JSON'
+{
+  "ops": [
+    {"action": "messages.unified", "box": "unread", "limit": 10, "format": "compact"},
+    {"action": "messages.quarantine", "ids": ["7844"], "dryRun": true}
+  ]
+}
+JSON
 ```
 
-Show details for a specific account:
-
-```bash
-mail-app-cli accounts show "Gmail"
-```
-
-### Mailboxes
-
-List all mailboxes:
-
-```bash
-mail-app-cli mailboxes list
-```
-
-List mailboxes for a specific account:
-
-```bash
-mail-app-cli mailboxes list --account "Gmail"
-```
-
-Include per-mailbox message totals (`TotalCount`; slower, enumerates each mailbox):
-
-```bash
-mail-app-cli mailboxes list --counts
-```
-
-### Messages
-
-List messages in a mailbox:
-
-```bash
-mail-app-cli messages list --account "Gmail" --mailbox "INBOX"
-```
-
-List with filters:
-
-```bash
-# Show only unread messages
-mail-app-cli messages list -a "Gmail" -m "INBOX" --unread
-
-# Show only flagged messages
-mail-app-cli messages list -a "Gmail" -m "INBOX" --flagged
-
-# Show messages since a specific date
-mail-app-cli messages list -a "Gmail" -m "INBOX" --since "2025-12-01"
-
-# Show messages since a specific date and time
-mail-app-cli messages list -a "Gmail" -m "INBOX" --since "2025-12-14 09:00:00"
-
-# Combine filters
-mail-app-cli messages list -a "Gmail" -m "INBOX" --unread --since "2025-12-01" --limit 10
-```
-
-> **`--with-content` caution:** fetching bodies can block Mail.app's entire
-> scripting interface if a body is not cached locally (see PERFORMANCE.md).
-> Use it on small, recently synced mailboxes, not from unattended jobs.
-
-Every message includes `MessageID` (the RFC 5322 `Message-ID` header) for
-free. Add `--with-headers` to `list` and the unified subcommands to also get
-`InReplyTo` and `References`, parsed from the message's raw headers, for
-building a threaded view; it is opt-in because bulk-fetching headers is
-roughly 9x slower than the other list fields:
-
-```bash
-mail-app-cli messages list -a "Gmail" -m "INBOX" --with-headers
-```
-
-`messages show` always includes `InReplyTo`/`References` (it already pays
-the cost of a single-message fetch for `Content`).
-
-Show full message details:
-
-```bash
-mail-app-cli messages show <message-id> -a "Gmail" -m "INBOX"
-```
-
-Mark messages as read/unread (any number of IDs, one Mail.app round trip):
-
-```bash
-# Mark as read
-mail-app-cli messages mark <message-id> [<message-id>...] -a "Gmail" -m "INBOX" --read
-
-# Mark as unread
-mail-app-cli messages mark <message-id> -a "Gmail" -m "INBOX" --read=false
-```
-
-Flag/unflag messages:
-
-```bash
-# Flag messages
-mail-app-cli messages flag <message-id> [<message-id>...] -a "Gmail" -m "INBOX" --flagged
-
-# Unflag a message
-mail-app-cli messages flag <message-id> -a "Gmail" -m "INBOX" --flagged=false
-```
-
-Archive messages:
-
-```bash
-mail-app-cli messages archive <message-id> [<message-id>...] -a "Exchange" -m "Inbox"
-```
-
-> **Gmail limitation:** archiving is refused for Gmail accounts. Mail.app
-> offers no safe scriptable archive for Gmail — scripted moves out of INBOX
-> silently revert on the next sync, and the only workaround that sticks
-> (bouncing the message through Trash) can permanently delete mail. Archive
-> Gmail messages in Mail.app or Gmail itself, or use `messages quarantine`
-> to park them in a holding mailbox.
-
-Move messages to another mailbox (the last argument is the target):
-
-```bash
-mail-app-cli messages move <message-id> [<message-id>...] "Archive" -a "Gmail" -m "INBOX"
-```
-
-### Quarantining Messages (the safe alternative to deleting)
-
-This CLI has **no delete command**. Instead of destroying mail, park messages in
-a holding mailbox:
-
-```bash
-mail-app-cli messages quarantine <message-id> [<message-id>...] -a "Gmail" -m "INBOX"
-
-# Park messages from any mix of accounts in one call
-mail-app-cli messages quarantine 399357 399364 401002
-
-# Use a different holding mailbox
-mail-app-cli messages quarantine <message-id> -a "Gmail" -m "INBOX" --box "Archive Hold"
-```
-
-The holding mailbox defaults to `待删除` and is created inside each message's
-own account the first time it is needed. Nothing is deleted: the messages stay
-in the mailbox and on the server, so the action is reversible from Mail.app at
-any time.
-
-Why a dedicated mailbox and not Trash: Mail.app permanently empties every
-account's Trash on its own schedule (the account properties *empty trash
-frequency* and *empty trash on quit*), so Trash is not a safe holding area.
-On Gmail, a mailbox **is** a Gmail label, so quarantining is a label move.
-
-All mutation commands accept multiple IDs and process them in a single
-Mail.app call.
-
-**Global IDs (no `--account`/`--mailbox`):** Mail.app message IDs are unique
-across all accounts, so mutations can also be run with just IDs — from any mix
-of accounts and mailboxes in one call. The output is then a JSON summary with a
-per-message status:
-
-```bash
-mail-app-cli messages archive 399357 399364 401002
-```
+The answer is always a JSON envelope on stdout:
 
 ```json
 {
+  "ok": true,
+  "okCount": 1,
+  "failed": 0,
   "results": [
-    {"id": "399357", "account": "Gmail", "mailbox": "All Mail", "status": "skipped", "gmail": true,
-     "error": "Gmail accounts cannot be archived via Mail.app scripting"},
-    {"id": "399364", "account": "Exchange", "mailbox": "Inbox", "status": "ok"},
-    {"id": "401002", "status": "missing"}
-  ],
-  "ok": 1, "missing": 1, "failed": 0, "skipped": 1
+    {"index": 0, "action": "accounts.list", "ok": true,
+     "data": {"count": 3, "accounts": [...]}}
+  ]
 }
 ```
 
-Statuses are `ok`, `missing`, `failed` (with `error`) and `skipped`. For
-`archive`, `--gmail skip|read` decides what happens to Gmail messages: leave
-them and report `skipped` (default), or mark them read. `move` resolves the
-target mailbox inside each message's own account. Each ID is reported individually: a missing ID does not stop
-the others, and the command exits non-zero listing the IDs that failed.
-
-> **Note:** when a message is moved (archive, move, quarantine) Mail.app
-> assigns it a **new ID** in the destination mailbox. Re-list the destination
-> if you need to act on it again.
-
-### Marking Whole Mailboxes as Read
-
-Mark every message in a mailbox as read in one call:
-
-```bash
-mail-app-cli mailboxes mark-read -a "Gmail" -m "Spam"
-```
-
-Or hit the provider-independent special mailboxes across all accounts. Mail.app
-resolves the names ("Trash" vs "Deleted Items", "Spam" vs "Junk Email") itself:
-
-```bash
-# Everything you never read anyway
-mail-app-cli mailboxes mark-read --trash --junk --archive
-mail-app-cli mailboxes mark-read --all            # same thing
-
-# Only some accounts (repeatable)
-mail-app-cli mailboxes mark-read --all -a "Skyward" -a "Intelligrit"
-
-# See what would change first
-mail-app-cli mailboxes mark-read --all --dry-run
-
-# Mark unread instead
-mail-app-cli mailboxes mark-read -a "Gmail" -m "INBOX" --unread
-```
-
-Output is a JSON array of `{account, mailbox, changed}` per mailbox touched.
-`--archive` matches a mailbox literally named "Archive"; Gmail's "All Mail" is
-skipped because it also holds every inbox message (pass `-m "All Mail"`
-explicitly if you really want that).
-
-### Drafting Email (you press Send)
-
-This CLI deliberately has **no send command**: it composes a message and saves
-it into Mail.app's Drafts mailbox, then you review it and press Send in
-Mail.app. Drafting is how a script or an assistant proposes an email without
-being able to send anything on its own.
-
-Draft a message:
-
-```bash
-mail-app-cli draft \
-  --account "Gmail" \
-  --to user@example.com \
-  --subject "Hello" \
-  --body "Message content here"
-```
-
-Draft to multiple recipients, with an attachment:
-
-```bash
-mail-app-cli draft \
-  -a "Gmail" \
-  -t user1@example.com \
-  -t user2@example.com \
-  -c cc@example.com \
-  -s "Multi-recipient message" \
-  --body "Content" \
-  --attach ~/report.pdf
-```
-
-The command outputs JSON describing the saved draft and prints a reminder on
-stderr:
+Failures carry a stable machine-readable code, so a caller branches on the code
+instead of parsing prose:
 
 ```json
+{"index": 1, "action": "messages.quarantine", "ok": false,
+ "error": {"code": "MESSAGE_MISSING", "message": "no message 7844",
+           "hint": "re-list the mailbox first: mutations assign new ids"}}
+```
+
+| Code | Meaning |
+|------|---------|
+| `INVALID_REQUEST` | The document or a parameter is wrong (unknown parameters are rejected, not ignored) |
+| `UNKNOWN_ACTION` | No such action |
+| `ACCOUNT_NOT_FOUND`, `MAILBOX_NOT_FOUND`, `MESSAGE_MISSING` | The named thing does not exist |
+| `PARTIAL_FAILURE` | The action ran, but not every id was handled — `data` lists which |
+| `HOLDING_BOX_UNAVAILABLE` | The quarantine mailbox is missing and could not be created |
+| `GMAIL_ARCHIVE_UNSUPPORTED` | Mail.app cannot archive Gmail; use `messages.quarantine` |
+| `DRAFT_UNVERIFIED` | The draft was composed but not seen in Drafts; look in Mail.app |
+| `MAIL_SCRIPT_ERROR`, `INTERNAL` | Mail.app or the tool failed |
+
+Conventions:
+
+- **Exit code** is `0` when every operation succeeded, `1` otherwise. The
+  envelope is printed either way.
+- **Output is single-line JSON** by default. Add `"pretty": true` to the document
+  to indent it (indentation roughly doubles a list result).
+- **List actions** accept `"format": "compact"`, which keeps only the fields a
+  triage decision needs (`id`, `account`, `mailbox`, `date`, `read`, `flagged`,
+  `from`, `subject`) and typically halves the payload.
+- **Multiple ids go in one call.** Omitting `account` and `mailbox` resolves ids
+  globally, because Mail.app message ids are unique database-wide. Give both or
+  neither.
+- Output is JSON-safe UTF-8 with HTML escaping off, so addresses read as
+  `Name <a@b.com>` rather than `Name \u003ca@b.com\u003e`.
+
+### Discover the interface at runtime
+
+```bash
+mail-app-cli '{"action":"schema"}'
+```
+
+returns every action with its summary and parameters (name, type, required,
+enum, default). This output is generated from the same structs the decoder uses,
+so it cannot drift from the implementation.
+
+## Actions
+
+### Read
+
+| Action | Parameters |
+|--------|-----------|
+| `schema` | — |
+| `accounts.list` | `noCache` |
+| `mailboxes.list` | `account`, `counts`, `unreadOnly`, `noCache` |
+| `messages.list` | `account`, `mailbox`, `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
+| `messages.unified` | `box` (`inbox\|unread\|flagged\|sent\|drafts\|trash\|junk`), `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
+| `messages.show` | `id`, `account`, `mailbox` |
+| `messages.search` | `query`, `account`, `mailbox`, `limit`, `format` |
+| `messages.resolve` | `ids` |
+| `attachments.list` | `id`, `account`, `mailbox` |
+| `attachments.save` | `id`, `account`, `mailbox`, `name`, `output` |
+
+`messages.unified` reads across all accounts in one call, and `since` accepts
+`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. `messages.search` matches subject and
+sender only — bodies are not searched, because doing so blocks Mail.app.
+`messages.resolve` reports where ids currently live and changes nothing, which is
+what the `dryRun` paths use.
+
+### Write
+
+| Action | Parameters |
+|--------|-----------|
+| `messages.mark` | `ids`, `read` (default true), `account`, `mailbox`, `dryRun` |
+| `messages.flag` | `ids`, `flagged` (default true), `account`, `mailbox`, `dryRun` |
+| `messages.move` | `ids`, `to`, `account`, `mailbox`, `dryRun` |
+| `messages.archive` | `ids`, `account`, `mailbox`, `gmailPolicy` (`skip\|read`), `dryRun` |
+| `messages.quarantine` | `ids`, `box`, `account`, `mailbox`, `dryRun` |
+| `mailboxes.markRead` | `account`, `mailbox`, `trash`, `junk`, `archive`, `all`, `unread`, `dryRun` |
+| `draft` | `account`, `from`, `to`, `cc`, `bcc`, `subject`, `body`, `attach`, `dryRun` |
+| `attachments.save` | `id`, `account`, `mailbox`, `name`, `output` |
+| `sync` | `account` |
+| `open` | `id`, `account`, `mailbox` |
+
+Notes that are easy to get wrong:
+
+- **A move changes the id.** Mail.app assigns the message a new id in the
+  destination mailbox, so re-list after `move`, `archive` or `quarantine`.
+- **`draft` never sends.** It reports the draft's `id` and `verified`. If Mail.app
+  has not stored it yet the result says `syncing`, and if it is not found the
+  action fails with `DRAFT_UNVERIFIED` rather than claiming success.
+- **Quarantine, don't delete.** For Gmail that is a label change, and for every
+  account it survives Mail.app's own `empty trash frequency` (which is why the
+  account's Trash is not a safe holding area).
+- **`draft --attach` and `messages.list --withContent` are the slow ones.** See
+  [PERFORMANCE.md](PERFORMANCE.md) for the measured cost model of everything
+  else.
+
+## Recipes
+
+Unread overview, cheapest first:
+
+```bash
+mail-app-cli '{"action":"mailboxes.list","unreadOnly":true}' \
+  | jq -r '.results[0].data.mailboxes[] | "\(.Account)/\(.Name): \(.UnreadCount)"'
+```
+
+What arrived since a point in time, across every account:
+
+```bash
+mail-app-cli '{"action":"messages.unified","box":"inbox","since":"2026-10-13","format":"compact"}' \
+  | jq -r '.results[0].data.messages[] | "\(.date[0:10])  \(.from)  —  \(.subject)"'
+```
+
+Read one message in full:
+
+```bash
+mail-app-cli '{"action":"messages.show","id":"7847","account":"Google","mailbox":"All Mail"}'
+```
+
+Propose changes, then apply them:
+
+```bash
+mail-app-cli '{"action":"messages.quarantine","ids":["7844","7846"],"dryRun":true}'
+mail-app-cli '{"action":"messages.quarantine","ids":["7844","7846"]}'
+```
+
+Compose a draft for a human to send (body needs no shell escaping):
+
+```bash
+mail-app-cli <<'JSON'
 {
-  "status": "saved",
-  "account": "Gmail",
-  "subject": "Hello",
-  "to": ["user@example.com"],
-  "attachments": 0,
-  "id": "7833",
-  "verified": true
+  "action": "draft",
+  "account": "Google",
+  "to": ["someone@example.com"],
+  "subject": "会议纪要",
+  "body": "第一行\n第二行带 \"引号\" 和 $变量\n第三行"
+}
+JSON
+```
+
+Mark the things nobody reads anyway, without moving anything:
+
+```bash
+mail-app-cli '{"action":"mailboxes.markRead","all":true,"dryRun":true}'
+mail-app-cli '{"action":"mailboxes.markRead","all":true}'
+```
+
+Hand a message to the user in Mail.app:
+
+```bash
+mail-app-cli '{"action":"open","id":"7847","account":"Google","mailbox":"All Mail"}'
+```
+
+## How it works
+
+Mail.app is driven through `osascript` (JavaScript for Automation and
+AppleScript). Every property read on a Mail.app object is one Apple event round
+trip and Mail.app answers them serially, which is why the client bulk-reads
+properties, resolves messages by id instead of by index, and batches mutations
+into a single call. [PERFORMANCE.md](PERFORMANCE.md) records the measured cost
+of each idiom and which ones were abandoned.
+
+Reads are cached briefly (`accounts`/`mailboxes` 60s, message lists 5 minutes per
+query); `noCache: true` bypasses it and mutations invalidate what they touch.
+
+## Project layout
+
+```
+main.go              transport: read the document, print the envelope, set the exit code
+pkg/api/             the JSON surface: request structs, schema, dispatch, handlers
+pkg/mail/            the Mail.app engine (AppleScript / JXA)
+pkg/cache/           the small on-disk cache
+```
+
+`go test ./...` covers request decoding, validation, the schema and the dry-run
+paths. Anything that would need a real mailbox is exercised manually instead.
+
+## JSON envelope reference
+
+```jsonc
+{
+  "ok": true,        // every operation succeeded
+  "okCount": 1,      // operations that succeeded
+  "failed": 0,       // operations that did not
+  "results": [
+    {
+      "index": 0,          // position in ops, or 0 for a single operation
+      "action": "accounts.list",
+      "ok": true,
+      "dryRun": false,     // true when the operation only reported
+      "data": { },         // action-specific payload
+      "error": {           // present when ok is false
+        "code": "MESSAGE_MISSING",
+        "message": "human and model readable",
+        "hint": "what to do next"
+      }
+    }
+  ],
+  "error": { }       // set only when the document itself could not be handled
 }
 ```
-
-> **Mail.app quirk:** explicitly saving a scripted message makes Mail.app write
-> a *second*, recipient-less copy of the draft — and not immediately: on
-> Exchange it shows up roughly 20 seconds later, so no verification window can
-> reliably catch it. Drafts also cannot be moved out of the Drafts mailbox to
-> clean that up (Mail.app re-materialises them there under a new id, however the
-> move is spelled). `draft` therefore never calls save: it composes the message
-> and lets Mail.app persist it, which settles on a single complete draft, then
-> polls for it and reports `id` plus:
->
-> - `verified: true` — the draft is in the Drafts mailbox.
-> - `syncing: true` — Mail.app stored it but has not populated it yet (still
->   uploading); check the recipient list in Mail.app before sending.
-> - `status: "unverified"` — the draft was not found; look in Mail.app.
->
-> If a recipient-less copy of the same subject ever shows up next to a complete
-> draft, its id is listed under `strayDrafts` with a warning. The CLI reports it
-> rather than touching it, because the only way to remove it would be to delete
-> it in Mail.app.
-
-To find drafts afterwards, use `mail-app-cli messages drafts`.
-
-### Search
-
-Search for messages across all mailboxes:
-
-```bash
-mail-app-cli search "important meeting"
-```
-
-Search with limit:
-
-```bash
-mail-app-cli search "project update" --limit 20
-```
-
-### Attachments
-
-List attachments in a message:
-
-```bash
-mail-app-cli attachments list <message-id> -a "Gmail" -m "INBOX"
-```
-
-Save an attachment:
-
-```bash
-mail-app-cli attachments save <message-id> "document.pdf" -a "Gmail" -m "INBOX"
-```
-
-Save to a specific path:
-
-```bash
-mail-app-cli attachments save <message-id> "document.pdf" -a "Gmail" -m "INBOX" -o ~/Downloads/document.pdf
-```
-
-## JSON Output and jq
-
-All commands output JSON format for easy parsing and scripting. The output is formatted with 2-space indentation for human readability while remaining machine-parseable.
-
-### Pretty Printing
-
-For even prettier output, pipe through `jq`:
-
-```bash
-mail-app-cli accounts list | jq
-```
-
-### jq Examples
-
-#### Filter accounts by email domain
-
-```bash
-mail-app-cli accounts list | jq '.[] | select(.EmailAddress | endswith("@gmail.com"))'
-```
-
-#### Get only enabled accounts
-
-```bash
-mail-app-cli accounts list | jq '.[] | select(.Enabled==true) | .Name'
-```
-
-#### Count unread messages across all mailboxes
-
-```bash
-mail-app-cli mailboxes list | jq '[.[].UnreadCount] | add'
-```
-
-#### Find mailboxes with unread messages
-
-```bash
-mail-app-cli mailboxes list | jq '.[] | select(.UnreadCount > 0) | {account: .Account, name: .Name, unread: .UnreadCount}'
-```
-
-#### Get just the subject lines from messages
-
-```bash
-mail-app-cli messages list -a "Gmail" -m "INBOX" | jq '.[].Subject'
-```
-
-#### Filter unread messages from specific sender
-
-```bash
-mail-app-cli messages list -a "Gmail" -m "INBOX" | jq '.[] | select(.Read==false and (.Sender | contains("boss@company.com")))'
-```
-
-#### Search and format results as CSV
-
-```bash
-mail-app-cli search "important" | jq -r '.[] | [.Account, .Mailbox, .Subject, .Sender] | @csv'
-```
-
-#### Count messages by account
-
-```bash
-mail-app-cli search "project" | jq 'group_by(.Account) | map({account: .[0].Account, count: length})'
-```
-
-#### Get attachment names from a message
-
-```bash
-mail-app-cli attachments list <message-id> -a "Gmail" -m "INBOX" | jq '.[].Name'
-```
-
-#### Find large attachments (>1MB)
-
-```bash
-mail-app-cli attachments list <message-id> -a "Gmail" -m "INBOX" | jq '.[] | select(.FileSize > 1048576)'
-```
-
-### Scripting Examples
-
-#### Check for unread messages
-
-```bash
-#!/bin/bash
-unread=$(mail-app-cli messages list -a "Gmail" -m "INBOX" --unread | jq 'length')
-if [ $unread -gt 0 ]; then
-  echo "You have $unread unread messages"
-fi
-```
-
-#### Archive all read messages (non-Gmail accounts)
-
-```bash
-#!/bin/bash
-mail-app-cli messages list -a "Exchange" -m "Inbox" | jq -r '.[] | select(.Read==true) | .ID' \
-  | xargs mail-app-cli messages archive -a "Exchange" -m "Inbox"
-```
-
-#### Daily unread summary
-
-```bash
-#!/bin/bash
-echo "Today's Unread Email Summary"
-echo "============================"
-mail-app-cli mailboxes list | jq -r '.[] | select(.UnreadCount > 0) | "\(.Account)/\(.Name): \(.UnreadCount) unread"'
-```
-
-#### Save all attachments from a sender
-
-```bash
-#!/bin/bash
-SENDER="colleague@company.com"
-ACCOUNT="Gmail"
-MAILBOX="INBOX"
-
-# Find all messages from sender
-mail-app-cli messages list -a "$ACCOUNT" -m "$MAILBOX" | jq -r ".[] | select(.Sender | contains(\"$SENDER\")) | .ID" | while read -r msg_id; do
-  # Get attachments for each message
-  mail-app-cli attachments list "$msg_id" -a "$ACCOUNT" -m "$MAILBOX" | jq -r '.[].Name' | while read -r att_name; do
-    echo "Saving: $att_name from message $msg_id"
-    mail-app-cli attachments save "$msg_id" "$att_name" -a "$ACCOUNT" -m "$MAILBOX" -o "~/Downloads/$att_name"
-  done
-done
-```
-
-## Project Structure
-
-```
-mail-app-cli/
-├── cmd/              # Cobra command definitions
-│   ├── root.go
-│   ├── accounts.go
-│   ├── mailboxes.go
-│   ├── messages.go
-│   ├── draft.go
-│   ├── search.go
-│   └── attachments.go
-├── pkg/
-│   └── mail/        # Mail.app AppleScript/JXA client
-│       └── client.go
-└── main.go
-```
-
-## How It Works
-
-The CLI uses AppleScript and JavaScript for Automation (JXA) to interact with Mail.app. This provides:
-
-- Native integration with Mail.app
-- Access to all Mail.app features
-- No external dependencies or APIs required
-- Works with all mail providers configured in Mail.app
-
-## Requirements
-
-- macOS (tested on macOS 12+)
-- Mail.app configured with at least one account
-- Go 1.21+ (for building from source)
-
-## Development
-
-### Prerequisites
-
-- Go 1.21 or higher
-- macOS with Mail.app
-
-### Building
-
-```bash
-go build -o mail-app-cli
-```
-
-### Testing
-
-```bash
-# Test account listing
-./mail-app-cli accounts list
-
-# Test mailbox listing
-./mail-app-cli mailboxes list
-
-# Test message listing
-./mail-app-cli messages list -a "Your Account" -m "INBOX" --limit 5
-```
-
-## Roadmap
-
-Future enhancements:
-
-- Rules management
-- Smart mailbox operations
-- Signatures management
-- VIP contacts
-- Export/import functionality
-- IMAP folder synchronization
-- Draft management
-
-## Contributing
-
-Contributions are welcome! This project follows standard Go conventions.
-
-### Guidelines
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes following Go best practices
-4. Write tests for new functionality
-5. Ensure all tests pass
-6. Commit your changes
-7. Push to the branch
-8. Open a Pull Request
-
-## About Intelligrit Labs
-
-mail-app-cli is developed by [Intelligrit Labs](https://intelligrit.com#labs), the R&D arm of Intelligrit LLC. We build tools for ourselves and release them for everyone. Intelligrit delivers AI-driven IT modernization for federal agencies.
 
 ## License
 
-MIT License - see LICENSE file for details
-
-## Support
-
-For issues, questions, or contributions, please open an issue on GitHub.
-
-## Acknowledgments
-
-- Built with Cobra CLI framework
-- Uses AppleScript and JXA for Mail.app integration
+MIT — see [LICENSE](LICENSE).

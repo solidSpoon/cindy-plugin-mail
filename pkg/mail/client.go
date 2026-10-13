@@ -1229,20 +1229,68 @@ func (c *Client) GetMessagesFromMultipleMailboxes(requests []struct {
 //
 // sent/drafts/trash/junk use Mail.app's JXA special-mailbox accessors
 // (mail.sentMailboxes() etc.) which don't require per-message filtering.
-func (c *Client) GetUnifiedMessagesJSON(mailboxType string, limit, offset int, withContent, withHeaders bool) ([]Message, error) {
+func (c *Client) GetUnifiedMessagesJSON(mailboxType string, limit, offset int, withContent, withHeaders bool, since string) ([]Message, error) {
 	switch mailboxType {
 	case "inbox", "unread", "flagged":
-		return c.getInboxBasedUnified(mailboxType, limit, offset, withContent, withHeaders)
+		return c.getInboxBasedUnified(mailboxType, limit, offset, withContent, withHeaders, since)
 	case "sent", "drafts", "trash", "junk":
-		return c.getSpecialMailboxUnified(mailboxType, limit, offset, withContent, withHeaders)
+		return c.getSpecialMailboxUnified(mailboxType, limit, offset, withContent, withHeaders, since)
 	default:
 		return nil, fmt.Errorf("unknown unified mailbox type: %s", mailboxType)
 	}
 }
 
+// MessageLocation reports where a Mail.app message id lives. ResolveMessages is
+// the read-only half of a mutation, used to answer "what would this touch?"
+// before anything is changed.
+type MessageLocation struct {
+	ID      string `json:"id"`
+	Exists  bool   `json:"exists"`
+	Account string `json:"account,omitempty"`
+	Mailbox string `json:"mailbox,omitempty"`
+}
+
+// ResolveMessages reports, for each id, whether it exists and which mailbox it
+// lives in. It never modifies anything. byId is available through any
+// container and mail ids are unique database-wide, so the unified inbox is used
+// as the lookup container (see MutateMessagesGlobal).
+func (c *Client) ResolveMessages(messageIDs []string) ([]MessageLocation, error) {
+	if len(messageIDs) == 0 {
+		return []MessageLocation{}, nil
+	}
+	idsJSON, _ := json.Marshal(messageIDs)
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+const wanted = %s;
+const out = [];
+const container = mail.inbox().messages;
+for (const id of wanted) {
+	const r = { id: String(id), exists: false };
+	try {
+		const mbox = container.byId(Number(id)).mailbox();
+		r.account = mbox.account().name();
+		r.mailbox = mbox.name();
+		r.exists = true;
+	} catch (e) {}
+	out.push(r);
+}
+JSON.stringify(out);
+`, string(idsJSON))
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return nil, err
+	}
+	var out []MessageLocation
+	if err := json.Unmarshal([]byte(output), &out); err != nil {
+		return nil, fmt.Errorf("unexpected output: %s", output)
+	}
+	return out, nil
+}
+
 // getInboxBasedUnified fetches messages from each account's INBOX using the
 // proven GetMessagesJSON path, then merges, sorts, and slices globally.
-func (c *Client) getInboxBasedUnified(mailboxType string, limit, offset int, withContent, withHeaders bool) ([]Message, error) {
+func (c *Client) getInboxBasedUnified(mailboxType string, limit, offset int, withContent, withHeaders bool, since string) ([]Message, error) {
 	// Resolve each account's real inbox name ("INBOX" vs "Inbox") via Mail's
 	// unified inbox rather than assuming a name.
 	refs, err := c.GetSpecialMailboxRefs("inbox")
@@ -1279,6 +1327,7 @@ func (c *Client) getInboxBasedUnified(mailboxType string, limit, offset int, wit
 			FlaggedOnly: mailboxType == "flagged",
 			WithContent: withContent,
 			WithHeaders: withHeaders,
+			Since:       since,
 		})
 	}
 
@@ -1339,7 +1388,7 @@ JSON.stringify(result);
 // getSpecialMailboxUnified lists a unified special mailbox by resolving the
 // per-account boxes and fetching each concurrently through GetMessagesJSON
 // (the bulk/byId fast path), then merging, sorting and slicing globally.
-func (c *Client) getSpecialMailboxUnified(mailboxType string, limit, offset int, withContent, withHeaders bool) ([]Message, error) {
+func (c *Client) getSpecialMailboxUnified(mailboxType string, limit, offset int, withContent, withHeaders bool, since string) ([]Message, error) {
 	refs, err := c.GetSpecialMailboxRefs(mailboxType)
 	if err != nil {
 		return nil, err
@@ -1375,7 +1424,7 @@ func (c *Client) getSpecialMailboxUnified(mailboxType string, limit, offset int,
 			WithContent bool
 			WithHeaders bool
 			Since       string
-		}{AccountName: r.Account, MailboxName: r.Mailbox, Limit: perLimit, WithContent: withContent, WithHeaders: withHeaders})
+		}{AccountName: r.Account, MailboxName: r.Mailbox, Limit: perLimit, WithContent: withContent, WithHeaders: withHeaders, Since: since})
 	}
 
 	messages, err := c.GetMessagesFromMultipleMailboxes(requests)

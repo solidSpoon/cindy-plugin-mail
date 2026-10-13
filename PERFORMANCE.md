@@ -21,27 +21,28 @@ and Mail.app answers them serially. Measured costs:
 ## How the CLI uses this
 
 - **Message lookup by ID** uses `byId()`. IDs are unique across the whole Mail
-  database, so no enumeration is needed; `messages show/mark/flag/quarantine/
-  archive/move` and attachment commands run in ~0.3 s regardless of mailbox size.
-- **Batch mutations** (`messages mark id1 id2 ...`) run in one `osascript`
+  database, so no enumeration is needed; `messages.show`, `messages.mark`, `messages.flag`, `messages.quarantine`,
+  `messages.archive`, `messages.move` and the attachment actions run in ~0.3 s
+  regardless of mailbox size.
+- **Batch mutations** (`messages.mark` with several ids) run in one `osascript`
   process: cost is one launch plus ~10 ms per message.
-- **`messages list`** is hybrid. Filters (`--unread`, `--flagged`, `--since`)
+- **`messages.list`** is hybrid. Filters (`unread`, `flagged`, `since`)
   always use one bulk read per property. Then:
   - if the mailbox is small relative to the page (`total <= max(2000, page*300)`)
     every field is bulk-read — a 40-message INBOX lists in ~0.2 s;
   - otherwise only the ids are bulk-read and the page's messages are resolved
     with `byId()` and read individually — a 21k-message "All Mail" lists in ~2.5 s.
-- **`mailboxes list`** bulk-reads names and unread counts. `TotalCount` is only
-  filled with `--counts` because it needs a `messages.length` per mailbox
+- **`mailboxes.list`** bulk-reads names and unread counts. `TotalCount` is only
+  filled with `counts: true` because it needs a `messages.length` per mailbox
   (~3 s across 80 mailboxes vs ~0.7 s without).
-- **`mailboxes mark-read`** uses `whose({readStatus: false})` and loops over the
+- **`mailboxes.markRead`** uses `whose({readStatus: false})` and loops over the
   result; bulk assignment on a `whose()` specifier is not supported. It skips
   mailboxes whose `unreadCount` is already 0.
 - Special mailboxes come from Mail's unified `trashMailbox`/`junkMailbox`/...
   properties (`.mailboxes()` gives the per-account boxes), so provider naming
   never matters.
 
-## `--with-content` can hang Mail.app
+## `withContent` can hang Mail.app
 
 `msg.content()` (and `msg.properties()`, which includes it) makes Mail's main
 thread wait synchronously on a MailCore worker in
@@ -52,7 +53,7 @@ not unblock it. Observed repeatedly on Gmail spam / "All Mail" messages right
 after a Mail restart.
 
 Mitigations: only request content for small, recently synced mailboxes; never
-call `--with-content` from unattended jobs against large or junk mailboxes; and
+call `withContent` from unattended jobs against large or junk mailboxes; and
 if `osascript -e "Application('Mail').accounts.length"` times out, sample Mail
 (`sample Mail 1`) — a stack containing `MCMessage(ScriptingSupport) content`
 means it must be restarted.
