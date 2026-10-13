@@ -21,10 +21,10 @@ cd ~/projects/mail-app-cli && go build -o ~/.local/bin/mail-app-cli .
 mail-app-cli --version
 ```
 
-The skill itself is maintained in that repo at `skill/mail-app-cli/`; copy it into place after changes:
+The skill itself is maintained in that repo at `skills/mail-app-cli/`; copy it into place after changes:
 
 ```bash
-rsync -a --delete ~/projects/mail-app-cli/skill/mail-app-cli/ ~/.agents/skills/mail-app-cli/
+rsync -a --delete ~/projects/mail-app-cli/skills/mail-app-cli/ ~/.agents/skills/mail-app-cli/
 ```
 
 First run needs Automation permission for Mail.app (System Settings → Privacy & Security → Automation).

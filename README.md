@@ -275,12 +275,12 @@ mail-app-cli '{"action":"open",
 ## Agent skill
 
 The agent-facing instructions for this tool live in the repo at
-[`skill/mail-app-cli/SKILL.md`](skill/mail-app-cli/SKILL.md). They are maintained
+[`skills/mail-app-cli/SKILL.md`](skills/mail-app-cli/SKILL.md). They are maintained
 here and copied into the agent's global skills directory, so the repo stays the
 source of truth:
 
 ```bash
-rsync -a --delete skill/mail-app-cli/ ~/.agents/skills/mail-app-cli/
+rsync -a --delete skills/mail-app-cli/ ~/.agents/skills/mail-app-cli/
 ```
 
 (`~/.agents/skills/` is Pi's global skill location; a folder there whose name
