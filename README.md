@@ -13,8 +13,8 @@ A command-line interface for controlling macOS Mail.app. Provides complete scrip
 - List and manage Mail.app accounts
 - Browse and manage mailboxes
 - List, read, search, and manage messages
-- Archive, move, delete, flag, and mark messages
-- Send emails
+- Archive, move, quarantine, flag, and mark messages
+- Compose drafts for you to review and send yourself (the CLI cannot send)
 - Manage attachments
 - Fully scriptable - perfect for automation and building GUIs
 - **Emacs Frontend**: Full-featured interactive Emacs mail client included in [`emacs/`](emacs/)
@@ -151,8 +151,8 @@ mail-app-cli messages archive <message-id> [<message-id>...] -a "Exchange" -m "I
 > offers no safe scriptable archive for Gmail — scripted moves out of INBOX
 > silently revert on the next sync, and the only workaround that sticks
 > (bouncing the message through Trash) can permanently delete mail. Archive
-> Gmail messages in Mail.app or Gmail itself, or use `messages delete` to
-> send them to Trash.
+> Gmail messages in Mail.app or Gmail itself, or use `messages quarantine`
+> to park them in a holding mailbox.
 
 Move messages to another mailbox (the last argument is the target):
 
@@ -160,13 +160,30 @@ Move messages to another mailbox (the last argument is the target):
 mail-app-cli messages move <message-id> [<message-id>...] "Archive" -a "Gmail" -m "INBOX"
 ```
 
-Delete messages:
+### Quarantining Messages (the safe alternative to deleting)
+
+This CLI has **no delete command**. Instead of destroying mail, park messages in
+a holding mailbox:
 
 ```bash
-mail-app-cli messages delete <message-id> [<message-id>...] -a "Gmail" -m "INBOX"
+mail-app-cli messages quarantine <message-id> [<message-id>...] -a "Gmail" -m "INBOX"
+
+# Park messages from any mix of accounts in one call
+mail-app-cli messages quarantine 399357 399364 401002
+
+# Use a different holding mailbox
+mail-app-cli messages quarantine <message-id> -a "Gmail" -m "INBOX" --box "Archive Hold"
 ```
 
-Deleting a message that is already in Trash removes it permanently.
+The holding mailbox defaults to `待删除` and is created inside each message's
+own account the first time it is needed. Nothing is deleted: the messages stay
+in the mailbox and on the server, so the action is reversible from Mail.app at
+any time.
+
+Why a dedicated mailbox and not Trash: Mail.app permanently empties every
+account's Trash on its own schedule (the account properties *empty trash
+frequency* and *empty trash on quit*), so Trash is not a safe holding area.
+On Gmail, a mailbox **is** a Gmail label, so quarantining is a label move.
 
 All mutation commands accept multiple IDs and process them in a single
 Mail.app call.
@@ -193,14 +210,14 @@ mail-app-cli messages archive 399357 399364 401002
 ```
 
 Statuses are `ok`, `missing`, `failed` (with `error`) and `skipped`. For
-`archive`, `--gmail skip|delete|read` decides what happens to Gmail messages:
-leave them and report `skipped` (default), move them to Trash, or mark them
-read. `move` resolves the target mailbox inside each message's own account. Each ID is reported individually: a missing ID does not stop
+`archive`, `--gmail skip|read` decides what happens to Gmail messages: leave
+them and report `skipped` (default), or mark them read. `move` resolves the
+target mailbox inside each message's own account. Each ID is reported individually: a missing ID does not stop
 the others, and the command exits non-zero listing the IDs that failed.
 
-> **Note:** when a message is moved (archive, move, delete) Mail.app assigns it
-> a **new ID** in the destination mailbox. Re-list the destination if you need
-> to act on it again.
+> **Note:** when a message is moved (archive, move, quarantine) Mail.app
+> assigns it a **new ID** in the destination mailbox. Re-list the destination
+> if you need to act on it again.
 
 ### Marking Whole Mailboxes as Read
 
@@ -233,29 +250,71 @@ Output is a JSON array of `{account, mailbox, changed}` per mailbox touched.
 skipped because it also holds every inbox message (pass `-m "All Mail"`
 explicitly if you really want that).
 
-### Sending Email
+### Drafting Email (you press Send)
 
-Send a message:
+This CLI deliberately has **no send command**: it composes a message and saves
+it into Mail.app's Drafts mailbox, then you review it and press Send in
+Mail.app. Drafting is how a script or an assistant proposes an email without
+being able to send anything on its own.
+
+Draft a message:
 
 ```bash
-mail-app-cli send \
+mail-app-cli draft \
   --account "Gmail" \
   --to user@example.com \
   --subject "Hello" \
   --body "Message content here"
 ```
 
-Send to multiple recipients:
+Draft to multiple recipients, with an attachment:
 
 ```bash
-mail-app-cli send \
+mail-app-cli draft \
   -a "Gmail" \
   -t user1@example.com \
   -t user2@example.com \
   -c cc@example.com \
   -s "Multi-recipient message" \
-  --body "Content"
+  --body "Content" \
+  --attach ~/report.pdf
 ```
+
+The command outputs JSON describing the saved draft and prints a reminder on
+stderr:
+
+```json
+{
+  "status": "saved",
+  "account": "Gmail",
+  "subject": "Hello",
+  "to": ["user@example.com"],
+  "attachments": 0,
+  "id": "7833",
+  "verified": true
+}
+```
+
+> **Mail.app quirk:** explicitly saving a scripted message makes Mail.app write
+> a *second*, recipient-less copy of the draft — and not immediately: on
+> Exchange it shows up roughly 20 seconds later, so no verification window can
+> reliably catch it. Drafts also cannot be moved out of the Drafts mailbox to
+> clean that up (Mail.app re-materialises them there under a new id, however the
+> move is spelled). `draft` therefore never calls save: it composes the message
+> and lets Mail.app persist it, which settles on a single complete draft, then
+> polls for it and reports `id` plus:
+>
+> - `verified: true` — the draft is in the Drafts mailbox.
+> - `syncing: true` — Mail.app stored it but has not populated it yet (still
+>   uploading); check the recipient list in Mail.app before sending.
+> - `status: "unverified"` — the draft was not found; look in Mail.app.
+>
+> If a recipient-less copy of the same subject ever shows up next to a complete
+> draft, its id is listed under `strayDrafts` with a warning. The CLI reports it
+> rather than touching it, because the only way to remove it would be to delete
+> it in Mail.app.
+
+To find drafts afterwards, use `mail-app-cli messages drafts`.
 
 ### Search
 
@@ -421,7 +480,7 @@ mail-app-cli/
 │   ├── accounts.go
 │   ├── mailboxes.go
 │   ├── messages.go
-│   ├── send.go
+│   ├── draft.go
 │   ├── search.go
 │   └── attachments.go
 ├── pkg/

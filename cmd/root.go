@@ -27,7 +27,7 @@ func init() {
 	rootCmd.AddCommand(accountsCmd)
 	rootCmd.AddCommand(mailboxesCmd)
 	rootCmd.AddCommand(messagesCmd)
-	rootCmd.AddCommand(sendCmd)
+	rootCmd.AddCommand(draftCmd)
 	rootCmd.AddCommand(attachmentsCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(syncCmd)

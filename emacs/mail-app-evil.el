@@ -121,7 +121,7 @@
       "S" 'mail-app-search-all
       "f" 'mail-app-flag-message-at-point
       "F" 'mail-app-forward-message-at-point
-      "d" 'mail-app-delete-message-at-point
+      "d" 'mail-app-quarantine-message-at-point
       "a" 'mail-app-archive-message-at-point
       "!" 'mail-app-junk-message-at-point
       "v" 'mail-app-move-message-at-point
@@ -132,7 +132,7 @@
       "m" 'mail-app-toggle-mark-at-point
       "M" 'mail-app-toggle-mark-backward
       "U" 'mail-app-unmark-all
-      "x" 'mail-app-delete-marked
+      "x" 'mail-app-quarantine-marked
       ",a" 'mail-app-archive-marked
       ",f" 'mail-app-flag-marked
       ",!" 'mail-app-junk-marked
@@ -159,7 +159,7 @@
       "c" 'mail-app-compose
       "J" 'mail-app-jump-to-mail-app
       "f" 'mail-app-flag-current-message
-      "d" 'mail-app-delete-current-message
+      "d" 'mail-app-quarantine-current-message
       "a" 'mail-app-archive-current-message
       "t" 'mail-app-mark-current-message
       "s" 'mail-app-save-attachment-at-point
@@ -178,14 +178,14 @@
       "r" 'mail-app-refresh
       "s" 'mail-app-search
       "f" 'mail-app-flag-thread-at-point
-      "d" 'mail-app-delete-thread-at-point
+      "d" 'mail-app-quarantine-thread-at-point
       "a" 'mail-app-archive-thread-at-point
       "t" 'mail-app-mark-thread-at-point
       ;; Marking for bulk operations
       "m" 'mail-app-toggle-thread-mark-at-point
       "M" 'mail-app-toggle-thread-mark-backward
       "U" 'mail-app-unmark-all
-      "x" 'mail-app-delete-marked-threads
+      "x" 'mail-app-quarantine-marked-threads
       ",a" 'mail-app-archive-marked-threads
       ",f" 'mail-app-flag-marked-threads
       ",j" 'mail-app-junk-marked-threads

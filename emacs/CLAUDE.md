@@ -164,7 +164,7 @@ When calling from Emacs, the arguments are passed as a list:
 
 ### Message Actions Context
 
-- Flag, delete, archive, mark operations require:
+- Flag, quarantine, archive, mark operations require:
   - `mail-app-current-account` (buffer-local)
   - `mail-app-current-mailbox` (buffer-local)
 - These are set when viewing messages from a mailbox
@@ -194,22 +194,22 @@ When calling from Emacs, the arguments are passed as a list:
 - `mail-app--act-on-marked` (commands) is the shared driver for every
   `mail-app-*-marked` command.  Never loop `mail-app--run-command` per message.
 - Archive passes `--gmail=<mail-app-gmail-archive-action>`; Gmail messages
-  are skipped/deleted/marked-read per that option and reported.
+  are skipped/marked-read per that option and reported.
 - `mail-app-mark-mailbox-as-read` / `mail-app-mark-special-read` use
   `mailboxes mark-read` (JSON `[{account, mailbox, changed}]` on stdout).
-- Moved/archived/deleted messages get a new ID in the destination mailbox.
+- Moved/archived/quarantined messages get a new ID in the destination mailbox.
 
 ### Message Actions (from list)
 
 - `mail-app-flag-message-at-point` - Toggle flag
-- `mail-app-delete-message-at-point` - Delete (with confirmation)
+- `mail-app-quarantine-message-at-point` - Park in the quarantine mailbox (with confirmation)
 - `mail-app-archive-message-at-point` - Archive
 - `mail-app-mark-message-at-point` - Toggle read/unread
 
 ### Message Actions (from view)
 
 - `mail-app-flag-current-message` - Flag current message
-- `mail-app-delete-current-message` - Delete current message (with confirmation)
+- `mail-app-quarantine-current-message` - Park current message in the quarantine mailbox (with confirmation)
 - `mail-app-archive-current-message` - Archive current message
 - `mail-app-mark-current-message` - Mark current message as unread
 
@@ -250,7 +250,7 @@ When making changes, verify:
 - [ ] Mailboxes list displays correctly
 - [ ] Can navigate to messages list
 - [ ] Can view individual messages
-- [ ] Flag/delete/archive/mark actions work
+- [ ] Flag/quarantine/archive/mark actions work
 - [ ] Search returns results
 - [ ] Unread filter works
 - [ ] Refresh updates display
@@ -263,10 +263,10 @@ When making changes, verify:
 
 Implemented functionality:
 - ✅ 4-level navigation (accounts → mailboxes → messages → message view)
-- ✅ Marking and bulk operations (delete, archive, flag, mark as read/unread)
+- ✅ Marking and bulk operations (quarantine, archive, flag, mark as read/unread)
 - ✅ Message composition via Emacs compose-mail
 - ✅ Reply and reply-all functionality
-- ✅ Sending via mail-app-cli
+- ✅ Drafting via mail-app-cli (nothing is ever sent by the wrapper)
 - ✅ Pagination with offset/limit
 - ✅ Contextual search (current account/mailbox) and global search
 - ✅ View cycling (plain text → full headers → attachments)

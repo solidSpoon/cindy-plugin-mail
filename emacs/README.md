@@ -12,7 +12,9 @@ Emacs interface for the mail-app CLI tool, providing a full-featured interface t
 - Browse messages with filtering (unread, flagged)
 - View full message details
 - Search across all emails
-- Flag, archive, delete, and mark messages
+- Flag, archive, quarantine, and mark messages
+- Nothing in the UI deletes or sends: `d` parks mail in a holding mailbox and
+  compose saves a draft for you to send from Mail.app
 - Full Emacspeak integration with custom speech and audio icons
 - Evil mode support with vim-like keybindings
 - Three-level navigation: mailboxes → messages → message view
@@ -116,12 +118,12 @@ From the message view:
 | `g` / `r` | `mail-app-refresh` | Refresh messages list |
 | `s` | `mail-app-search` | Search all email |
 | `f` | `mail-app-flag-message-at-point` | Toggle flag on message |
-| `d` | `mail-app-delete-message-at-point` | Delete message (with confirmation) |
+| `d` | `mail-app-quarantine-message-at-point` | Park message in the quarantine mailbox (with confirmation) |
 | `a` | `mail-app-archive-message-at-point` | Archive message |
 | `m` | `mail-app-mark-message-at-point` | Toggle read/unread status |
 | `u` | `mail-app-show-unread` | Toggle unread filter |
 | `m` / `M` | `mail-app-toggle-mark-at-point` / `-backward` | Mark message for a bulk action |
-| `x` | `mail-app-delete-marked` | Delete marked messages |
+| `x` | `mail-app-quarantine-marked` | Park marked messages in the quarantine mailbox |
 | `,a` `,f` `,j` `,v` `,r` `,u` | `mail-app-*-marked` | Archive / flag / junk / move / read / unread marked messages |
 | `q` | `quit-window` | Quit window |
 | `?` | `describe-mode` | Show help |
@@ -130,9 +132,13 @@ Bulk actions on marked messages are one `mail-app-cli` call regardless of how
 many accounts the messages span, so marking fifty messages and pressing `x`
 costs one Mail.app round trip, not fifty.
 
+Quarantining moves messages into a holding mailbox (default `待删除`, created on
+demand in each message's own account) and never deletes anything, so it is
+reversible from Mail.app at any time.
+
 Archiving Gmail messages is not possible through Mail.app scripting; what
 happens to them is governed by `mail-app-gmail-archive-action` (`skip` and
-report by default, `delete` to Trash, or `read`).
+report by default, or `read`).
 
 ### Message View Mode
 
@@ -142,7 +148,7 @@ report by default, `delete` to Trash, or `read`).
 | `p` | `previous-line` | Scroll up |
 | `v` | `mail-app-cycle-view` | Cycle view modes (plain → full → attachments) |
 | `f` | `mail-app-flag-current-message` | Flag current message |
-| `d` | `mail-app-delete-current-message` | Delete current message (with confirmation) |
+| `d` | `mail-app-quarantine-current-message` | Park current message in the quarantine mailbox (with confirmation) |
 | `a` | `mail-app-archive-current-message` | Archive current message |
 | `t` | `mail-app-mark-current-message` | Mark current message as unread |
 | `r` | `mail-app-reply-current-message` | Reply to current message |
@@ -181,7 +187,6 @@ Full Emacspeak integration includes:
 - **Audio icons**:
   - `open-object` when opening lists or views
   - `select-object` when flagging, archiving, or marking messages
-  - `delete-object` when deleting messages
 - **Context-aware speech**: Messages include flag status and other metadata in spoken output
 
 ## Customization
@@ -197,7 +202,7 @@ Available customization options:
 - `mail-app-default-account`: Default account to use (or nil to prompt)
 - `mail-app-message-limit`: Maximum number of messages to display
 - `mail-app-mark-as-read-on-view`: Auto-mark messages as read when viewing (default: t)
-- `mail-app-gmail-archive-action`: What archive does to Gmail messages: `skip` (default), `delete`, or `read`
+- `mail-app-gmail-archive-action`: What archive does to Gmail messages: `skip` (default) or `read`
 - `mail-app-no-content-mailbox-regexp`: Mailboxes (Trash, Deleted Items, Spam, Junk...) whose bodies are never fetched even with content reading on; the unified trash/junk views are always excluded
 - `mail-app-mailbox-counts`: Show total message counts in mailbox lists (default: nil; costs ~3s vs <1s)
 - `mail-app-default-accounts-sort-method`: Default sort for accounts list

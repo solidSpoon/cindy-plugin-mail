@@ -882,16 +882,18 @@ skip the prompt and return their one message."
         (?t msgs)))))
 
 
-(defun mail-app-delete-thread-at-point ()
-  "Delete the thread at point, asking message-or-thread scope first."
+(defun mail-app-quarantine-thread-at-point ()
+  "Park the thread at point in the quarantine mailbox, asking message-or-thread scope first.
+Nothing is deleted; the messages move to the quarantine mailbox and stay
+reversible from Mail.app."
   (interactive)
   (let ((thread (get-text-property (point) 'mail-app-thread-data)))
     (if (not thread)
         (message "No thread at point")
-      (let ((msgs (mail-app--thread-action-scope thread "Delete")))
+      (let ((msgs (mail-app--thread-action-scope thread "Quarantine")))
         (when msgs
-          (mail-app--act-on-messages msgs "Delete" "Deleted" t
-                                     "messages" "delete"))))))
+          (mail-app--act-on-messages msgs "Quarantine" "Quarantined" t
+                                     "messages" "quarantine"))))))
 
 
 (defun mail-app-archive-thread-at-point ()
@@ -1023,10 +1025,10 @@ LABEL/VERB-PAST/CONFIRM/ARGS as in `mail-app--act-on-messages'."
         (apply #'mail-app--act-on-messages msgs label verb-past nil args)))))
 
 
-(defun mail-app-delete-marked-threads ()
-  "Delete every message of the marked threads (with confirmation)."
+(defun mail-app-quarantine-marked-threads ()
+  "Park every message of the marked threads in the quarantine mailbox."
   (interactive)
-  (mail-app--act-on-marked-threads "Delete" "Deleted" t "messages" "delete"))
+  (mail-app--act-on-marked-threads "Quarantine" "Quarantined" t "messages" "quarantine"))
 
 
 (defun mail-app-archive-marked-threads ()
@@ -1301,7 +1303,7 @@ window, and kills the view buffer being left."
                                     'face 'bold))
                  (insert "\n")
                  (insert "Commands: [r] reply  [R] reply-all  [TAB] cycle view  [S-TAB] cycle reverse\n")
-                 (insert "          [f] flag  [d] delete  [a] archive  [t] unread  [c] compose\n")
+                 (insert "          [f] flag  [d] quarantine  [a] archive  [t] unread  [c] compose\n")
                  (insert "          [J] jump to Mail.app  [g] refresh  [q] quit  [?] help\n\n")
                  (insert (make-string 80 ?=) "\n\n")
                  (if (null attachments)
@@ -1337,7 +1339,7 @@ window, and kills the view buffer being left."
                                   'face 'bold))
                (insert "\n")
                (insert "Commands: [r] reply  [R] reply-all  [TAB] cycle view  [S-TAB] cycle reverse\n")
-               (insert "          [f] flag  [d] delete  [a] archive  [t] unread  [c] compose\n")
+               (insert "          [f] flag  [d] quarantine  [a] archive  [t] unread  [c] compose\n")
                (insert "          [J] jump to Mail.app  [g] refresh  [q] quit  [?] help\n\n")
                (insert (make-string 80 ?=) "\n\n")
                (cond
@@ -1502,14 +1504,14 @@ each message. When disabled, only subject and sender are read."
 
 
 
-(defun mail-app-delete-message-at-point ()
-  "Delete message at point."
+(defun mail-app-quarantine-message-at-point ()
+  "Park the message at point in the quarantine mailbox."
   (interactive)
   (let ((message (mail-app--get-message-at-point)))
     (if (not message)
         (message "No message at point")
-      (when (yes-or-no-p "Delete this message? ")
-        (mail-app--speak "Deleting message" 'delete-object)
+      (when (yes-or-no-p "Park this message in the quarantine mailbox? ")
+        (mail-app--speak "Parking message" 'select-object)
         (let* ((id (plist-get message :id))
                ;; Get account/mailbox from message data (for unified views)
                (account (or (plist-get message :account) mail-app-current-account))
@@ -1519,9 +1521,9 @@ each message. When disabled, only subject and sender are read."
            (lambda (output)
              (when (buffer-live-p buf)
                (with-current-buffer buf
-                 (mail-app--speak "Deleted" 'task-done)
+                 (mail-app--speak "Quarantined" 'task-done)
                  (mail-app-refresh))))
-           "messages" "delete" id
+           "messages" "quarantine" id
            "-a" account
            "-m" mailbox))))))
 
@@ -1666,21 +1668,21 @@ each message. When disabled, only subject and sender are read."
 
 
 
-(defun mail-app-delete-current-message ()
-  "Delete current message in message view."
+(defun mail-app-quarantine-current-message ()
+  "Park current message in the quarantine mailbox from the message view."
   (interactive)
   (when (and mail-app-current-message-id
-             (yes-or-no-p "Delete this message? "))
-    (mail-app--speak "Deleting message" 'delete-object)
+             (yes-or-no-p "Park this message in the quarantine mailbox? "))
+    (mail-app--speak "Parking message" 'select-object)
     (let ((win (selected-window)))
       (mail-app--run-command-async
        (lambda (output)
-         (message "Message deleted")
-         (mail-app--speak "Deleted" 'task-done)
+         (message "Message parked in the quarantine mailbox")
+         (mail-app--speak "Quarantined" 'task-done)
          (when (window-live-p win)
            (with-selected-window win
              (quit-window))))
-       "messages" "delete" mail-app-current-message-id
+       "messages" "quarantine" mail-app-current-message-id
        "-a" mail-app-current-account
        "-m" mail-app-current-mailbox))))
 
@@ -1965,7 +1967,12 @@ Updates From: header, message-options, active signature, and buffer-local state.
   (define-key message-mode-map (kbd "C-c i") 'mail-app-select-identity))
 
 (defun mail-app-send-message ()
-  "Send the current message using mail-app-cli."
+  "Save the current message as a draft in Mail.app.  Nothing is sent.
+
+Sending is deliberately not scriptable: this saves the buffer into
+Mail.app's Drafts mailbox so that you can review it and press Send there.
+It is used as `message-send-mail-function', where message-mode treats
+the buffer as handled; the draft itself lives in Mail.app."
   (interactive)
   (save-excursion
     (goto-char (point-min))
@@ -2035,7 +2042,7 @@ Updates From: header, message-options, active signature, and buffer-local state.
       (unless (or account from)
         (error "No account or sender specified"))
 
-      (let ((args (list "send" "-s" subject "--body" body-text)))
+      (let ((args (list "draft" "-s" subject "--body" body-text)))
         (when account
           (setq args (append args (list "-a" account))))
         (when (and from (not (string-empty-p from)))
@@ -2057,13 +2064,14 @@ Updates From: header, message-options, active signature, and buffer-local state.
         (apply 'mail-app--run-command args)
         (let ((target (or account from)))
           (if (> (length attachments) 0)
-              (message "Message sent via %s with %d attachment(s)" target (length attachments))
-            (message "Message sent via %s" target)))
+              (message "Draft saved to Mail.app via %s with %d attachment(s) — review it and press Send there" target (length attachments))
+            (message "Draft saved to Mail.app via %s — review it and press Send there" target)))
         ;; Do not kill buffer here, let message-mode handle it
         t))))
 
 (defun mail-app--message-send-mail ()
-  "Send mail using mail-app-cli instead of default sendmail."
+  "Save mail as a Mail.app draft instead of using the default sendmail.
+Nothing is sent; review the draft in Mail.app and press Send there."
   (mail-app-send-message)
   ;; Let message-mode handle buffer cleanup
   t)
@@ -2189,10 +2197,10 @@ LABEL is spoken while working (\"Deleting\"); VERB-PAST heads the summary
 
 
 
-(defun mail-app-delete-marked ()
-  "Delete all marked messages."
+(defun mail-app-quarantine-marked ()
+  "Park all marked messages in the quarantine mailbox."
   (interactive)
-  (mail-app--act-on-marked "Deleting" "Deleted" t "messages" "delete"))
+  (mail-app--act-on-marked "Parking" "Quarantined" t "messages" "quarantine"))
 
 
 

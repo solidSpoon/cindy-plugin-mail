@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Client provides an interface to interact with Mail.app via AppleScript
@@ -153,6 +154,27 @@ function resolveMessage(mbox, id) {
 	if (!isFinite(n)) return null;
 	const m = mbox.messages.byId(n);
 	try { m.id(); return m; } catch (e) { return null; }
+}
+// ensureMailbox returns the mailbox called name inside the account,
+// creating it at the account's top level when it does not exist yet. Used by
+// messages quarantine, which parks messages in a dedicated holding mailbox.
+// Several creation spellings are attempted because Mail.app's scripting
+// support for mailbox creation differs between release trains.
+function ensureMailbox(acc, name) {
+	let mb = resolveMailbox(acc, name);
+	if (mb) return mb;
+	try {
+		mail.make({ new: 'mailbox', at: acc.mailboxes, withProperties: { name: name } });
+	} catch (e) {
+		try {
+			acc.mailboxes.push(mail.Mailbox({ name: name }));
+		} catch (e2) {
+			try {
+				mail.make({ new: 'mailbox', at: acc, withProperties: { name: name } });
+			} catch (e3) {}
+		}
+	}
+	return resolveMailbox(acc, name);
 }
 `
 
@@ -339,17 +361,54 @@ func (c *Client) FlagMessage(accountName, mailboxName, messageID string, flagged
 	return res.Err()
 }
 
-// DeleteMessage moves a message to trash
-func (c *Client) DeleteMessage(accountName, mailboxName, messageID string) error {
-	res, err := c.DeleteMessages(accountName, mailboxName, []string{messageID})
-	if err != nil {
-		return err
-	}
-	return res.Err()
+// DefaultQuarantineMailbox is the holding mailbox used by `messages
+// quarantine`. Messages are *moved* here, never deleted, so the operation stays
+// reversible from Mail.app.
+//
+// A dedicated mailbox is used instead of the account's Trash because Mail.app
+// permanently empties Trash on its own schedule (see the account properties
+// "empty trash frequency" and "empty trash on quit").
+const DefaultQuarantineMailbox = "待删除"
+
+// DraftResult describes a draft saved into Mail.app's Drafts mailbox.
+type DraftResult struct {
+	Status      string   `json:"status"`
+	Account     string   `json:"account"`
+	Subject     string   `json:"subject"`
+	To          []string `json:"to"`
+	Cc          []string `json:"cc,omitempty"`
+	Bcc         []string `json:"bcc,omitempty"`
+	Attachments int      `json:"attachments"`
+	// ID is the Mail.app message id of the draft once Mail.app persists it.
+	ID string `json:"id,omitempty"`
+	// Verified is false when the draft could not be found in the Drafts mailbox
+	// within the polling window, so the caller knows to look in Mail.app.
+	Verified bool `json:"verified"`
+	// Syncing is true when Mail.app has stored the draft but has not populated
+	// it yet (no recipients visible), which happens while it uploads to the
+	// server. There is nothing to do but look at it in Mail.app.
+	Syncing bool `json:"syncing,omitempty"`
+	// StrayDrafts lists recipient-less copies of this subject that sit next to a
+	// complete draft. They should not normally exist; see SaveDraft.
+	StrayDrafts []string `json:"strayDrafts,omitempty"`
+	Warnings    []string `json:"warnings,omitempty"`
 }
 
-// SendMessage sends a new email message
-func (c *Client) SendMessage(accountName, from, subject, body string, to, cc, bcc, attachments []string) error {
+// SaveDraft composes a message and saves it to Mail.app's Drafts mailbox
+// *without sending it*. Sending is deliberately not scriptable: the user
+// reviews the draft in Mail.app and presses Send there.
+//
+// The compose message is never explicitly saved. Both `save` and
+// `close saving yes` leave a recipient-less stray copy of the draft behind on
+// Exchange accounts - and not immediately: it shows up roughly 20s later, long
+// after any reasonable verification window. Compose message persistence is left
+// to Mail.app instead, which settles on a single complete draft on both the
+// Exchange and Gmail accounts here.
+//
+// Because that persistence is asynchronous, the result is verified by polling
+// the Drafts mailbox and is reported honestly: `verified` only when the draft
+// was found, `syncing` when only a not-yet-populated copy is visible yet.
+func (c *Client) SaveDraft(accountName, from, subject, body string, to, cc, bcc, attachments []string) (*DraftResult, error) {
 	// Escape all recipients
 	var toList, ccList, bccList string
 	var escapedTo, escapedCc, escapedBcc []string
@@ -416,7 +475,7 @@ func (c *Client) SendMessage(accountName, from, subject, body string, to, cc, bc
 					end repeat
 				end if
 %s
-			send
+			delay 2
 			end tell
 			return "Success"
 		on error errMsg
@@ -430,8 +489,130 @@ func (c *Client) SendMessage(accountName, from, subject, body string, to, cc, bc
 		bccList, bccList,
 		attachCode)
 
-	_, err := c.runAppleScript(script)
-	return err
+	out, err := c.runAppleScript(script)
+	if err != nil {
+		return nil, err
+	}
+	// The script reports failures in its return value instead of raising, so
+	// turn them into real errors rather than a silent success.
+	if strings.HasPrefix(out, "Error: ") {
+		return nil, fmt.Errorf("%s", strings.TrimPrefix(out, "Error: "))
+	}
+
+	if to == nil {
+		to = []string{}
+	}
+	result := &DraftResult{
+		Status:      "saved",
+		Account:     accountName,
+		Subject:     subject,
+		To:          to,
+		Cc:          cc,
+		Bcc:         bcc,
+		Attachments: len(attachments),
+	}
+
+	// Mail.app persists the compose message on its own schedule; poll for it
+	// rather than declaring success on faith.
+	copies := &DraftCopies{}
+	for attempt := 0; attempt < 8; attempt++ {
+		copies, err = c.FindDraftCopies(accountName, subject)
+		if err != nil {
+			return nil, err
+		}
+		if len(copies.Complete) > 0 {
+			break
+		}
+		time.Sleep(900 * time.Millisecond)
+	}
+
+	switch {
+	case len(copies.Complete) > 0:
+		result.Verified = true
+		result.ID = copies.Complete[0]
+	case len(copies.Strays) > 0:
+		// Only a not-yet-populated copy is visible: Mail.app is still storing it.
+		result.Verified = true
+		result.Syncing = true
+		result.ID = copies.Strays[0]
+		result.Warnings = append(result.Warnings,
+			"Mail.app is still storing this draft; the recipient list may not be visible yet - check it in Mail.app before sending")
+		return result, nil
+	default:
+		result.Status = "unverified"
+		result.Warnings = append(result.Warnings,
+			"the draft was not found in the Drafts mailbox; open Mail.app to check it")
+		return result, nil
+	}
+
+	if len(copies.Strays) > 0 {
+		result.StrayDrafts = copies.Strays
+		result.Warnings = append(result.Warnings, fmt.Sprintf(
+			"Mail.app left %d recipient-less copy/copies of this draft (%s); remove them in Mail.app",
+			len(copies.Strays), strings.Join(copies.Strays, ", ")))
+	}
+	return result, nil
+}
+
+// DraftCopies holds the drafts Mail.app has for one subject in one account's
+// Drafts mailbox, split into complete drafts (recipients present) and strays
+// (recipient-less copies).
+type DraftCopies struct {
+	Complete []string `json:"complete"`
+	Strays   []string `json:"strays"`
+}
+
+// jsFindDraftCopies looks up drafts by exact subject in the account's Drafts
+// mailbox. Recipient-less copies are reported separately so callers can tell
+// Mail.app's stray duplicate from a real draft.
+const jsFindDraftCopies = `
+const accountName = '%s';
+const subject = '%s';
+const out = { complete: [], strays: [] };
+try {
+	const acc = mail.accounts.byName(accountName);
+	let drafts = null;
+	try {
+		const boxes = mail.draftsMailbox().mailboxes();
+		for (let i = 0; i < boxes.length; i++) {
+			try { if (boxes[i].account().name() === accountName) { drafts = boxes[i]; break; } } catch (e) {}
+		}
+	} catch (e) {}
+	if (drafts) {
+		const ids = drafts.messages.id();
+		const subjects = drafts.messages.subject();
+		for (let i = 0; i < ids.length; i++) {
+			if (String(subjects[i]) !== subject) continue;
+			const id = Number(ids[i]);
+			let recipients = 0;
+			try { recipients = drafts.messages.byId(id).toRecipients().length; } catch (e) {}
+			if (recipients > 0) out.complete.push(String(id)); else out.strays.push(String(id));
+		}
+	}
+} catch (e) { out.error = String(e); }
+JSON.stringify(out);
+`
+
+// FindDraftCopies returns the drafts in accountName's Drafts mailbox whose
+// subject matches exactly.
+func (c *Client) FindDraftCopies(accountName, subject string) (*DraftCopies, error) {
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsFindDraftCopies, escapeJSString(accountName), escapeJSString(subject))
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return nil, err
+	}
+	res := &DraftCopies{}
+	if output != "" {
+		if err := json.Unmarshal([]byte(output), res); err != nil {
+			return nil, fmt.Errorf("unexpected output: %s", output)
+		}
+	}
+	sort.Strings(res.Complete)
+	sort.Strings(res.Strays)
+	return res, nil
 }
 
 // Helper function to parse accounts from AppleScript output
@@ -1427,51 +1608,6 @@ func (c *Client) BulkFlagMessages(requests []struct {
 	return nil
 }
 
-// BulkDeleteMessages deletes multiple messages concurrently
-func (c *Client) BulkDeleteMessages(requests []struct {
-	AccountName string
-	MailboxName string
-	MessageID   string
-}) error {
-	if len(requests) == 0 {
-		return nil
-	}
-
-	// If only one request, no need for parallelization
-	if len(requests) == 1 {
-		req := requests[0]
-		return c.DeleteMessage(req.AccountName, req.MailboxName, req.MessageID)
-	}
-
-	// Process deletes in parallel
-	errors := make(chan error, len(requests))
-
-	// Launch goroutine for each delete operation
-	for _, req := range requests {
-		go func(r struct {
-			AccountName string
-			MailboxName string
-			MessageID   string
-		}) {
-			errors <- c.DeleteMessage(r.AccountName, r.MailboxName, r.MessageID)
-		}(req)
-	}
-
-	// Collect results
-	var errorList []error
-	for i := 0; i < len(requests); i++ {
-		if err := <-errors; err != nil {
-			errorList = append(errorList, err)
-		}
-	}
-
-	if len(errorList) > 0 {
-		return fmt.Errorf("failed to delete some messages: %v", errorList)
-	}
-
-	return nil
-}
-
 // BulkArchiveMessages archives multiple messages concurrently
 func (c *Client) BulkArchiveMessages(requests []struct {
 	AccountName string
@@ -1858,12 +1994,6 @@ func (c *Client) FlagMessages(accountName, mailboxName string, messageIDs []stri
 	return c.mutateMessages(accountName, mailboxName, messageIDs, "", fmt.Sprintf("msg.flaggedStatus = %t;", flagged))
 }
 
-// DeleteMessages moves several messages to Trash in one Mail.app round trip.
-// Messages already in Trash are deleted permanently by Mail.app.
-func (c *Client) DeleteMessages(accountName, mailboxName string, messageIDs []string) (*MutationResult, error) {
-	return c.mutateMessages(accountName, mailboxName, messageIDs, "", "msg.delete();")
-}
-
 // MoveMessages moves several messages to targetMailbox in one round trip.
 func (c *Client) MoveMessages(accountName, sourceMailbox string, messageIDs []string, targetMailbox string) (*MutationResult, error) {
 	prelude := fmt.Sprintf(`const destMbox = resolveMailbox(acc, '%s');
@@ -1875,10 +2005,117 @@ func (c *Client) MoveMessages(accountName, sourceMailbox string, messageIDs []st
 // ArchiveMessage for why Gmail accounts are refused.
 func (c *Client) ArchiveMessages(accountName, mailboxName string, messageIDs []string) (*MutationResult, error) {
 	prelude := `if (resolveMailbox(acc, 'All Mail')) throw 'Gmail accounts cannot be archived safely via Mail.app scripting. ' +
-		'Archive it in Mail.app or Gmail directly, or use "messages delete" to move it to Trash.';
+		'Archive it in Mail.app or Gmail directly, or use "messages quarantine" to park it in a holding mailbox.';
 	const destMbox = resolveMailbox(acc, 'Archive');
 	if (!destMbox) throw 'Archive mailbox not found';`
 	return c.mutateMessages(accountName, mailboxName, messageIDs, prelude, "mail.move(msg, { to: destMbox });")
+}
+
+// QuarantineMessages moves several messages into a holding mailbox instead of
+// deleting them, creating that mailbox inside each message's own account when
+// it does not exist yet. Nothing is destroyed and the move is reversible from
+// Mail.app, so this is the safe replacement for `messages delete`.
+//
+// Creation and the move run in separate osascript processes: a mailbox created
+// inside the same script that moves messages into it hands back an unusable
+// specifier ("Can't get object"), because Mail.app has not refreshed its
+// mailbox list yet.
+func (c *Client) QuarantineMessages(mailboxName string, messageIDs []string) (*GlobalSummary, error) {
+	if mailboxName == "" {
+		mailboxName = DefaultQuarantineMailbox
+	}
+	accounts, err := c.HoldingMailboxAccounts(messageIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, account := range accounts {
+		if _, err := c.EnsureHoldingMailbox(account, mailboxName); err != nil {
+			return nil, err
+		}
+	}
+	return c.MutateMessagesGlobal(messageIDs, "quarantine", mailboxName, "")
+}
+
+// QuarantineMessagesIn is the scoped form of QuarantineMessages: the messages
+// are looked up in one known mailbox instead of being resolved globally.
+func (c *Client) QuarantineMessagesIn(accountName, mailboxName, boxName string, messageIDs []string) (*MutationResult, error) {
+	if boxName == "" {
+		boxName = DefaultQuarantineMailbox
+	}
+	if _, err := c.EnsureHoldingMailbox(accountName, boxName); err != nil {
+		return nil, err
+	}
+	box := escapeJSString(boxName)
+	prelude := fmt.Sprintf(`const destMbox = resolveMailbox(acc, '%s');
+	if (!destMbox) throw 'Holding mailbox "%s" is missing in ' + acc.name();`, box, box)
+	return c.mutateMessages(accountName, mailboxName, messageIDs, prelude, "mail.move(msg, { to: destMbox });")
+}
+
+// HoldingMailboxAccounts returns the distinct account names that own the given
+// Mail.app message ids, so a holding mailbox can be created only where it is
+// actually needed. Ids that cannot be resolved are ignored.
+func (c *Client) HoldingMailboxAccounts(messageIDs []string) ([]string, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	idsJSON, _ := json.Marshal(messageIDs)
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+const wanted = %s;
+const seen = {};
+const accounts = [];
+const container = mail.inbox().messages;
+for (const id of wanted) {
+	try {
+		const name = container.byId(Number(id)).mailbox().account().name();
+		if (!seen[name]) { seen[name] = true; accounts.push(name); }
+	} catch (e) {}
+}
+JSON.stringify(accounts);
+`, string(idsJSON))
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return nil, err
+	}
+	var accounts []string
+	if err := json.Unmarshal([]byte(output), &accounts); err != nil {
+		return nil, fmt.Errorf("unexpected output: %s", output)
+	}
+	return accounts, nil
+}
+
+// EnsureHoldingMailbox creates boxName inside accountName when it does not
+// exist yet and reports whether it created it. It runs in its own osascript
+// process on purpose: see QuarantineMessages.
+func (c *Client) EnsureHoldingMailbox(accountName, boxName string) (bool, error) {
+	if boxName == "" {
+		boxName = DefaultQuarantineMailbox
+	}
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+const acc = mail.accounts.byName('%s');
+const name = '%s';
+if (resolveMailbox(acc, name)) {
+	JSON.stringify({ created: false });
+} else {
+	ensureMailbox(acc, name);
+	JSON.stringify({ created: true });
+}
+`, escapeJSString(accountName), escapeJSString(boxName))
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return false, err
+	}
+	var res struct {
+		Created bool `json:"created"`
+	}
+	if err := json.Unmarshal([]byte(output), &res); err != nil {
+		return false, fmt.Errorf("unexpected output: %s", output)
+	}
+	return res.Created, nil
 }
 
 // MailboxMarkResult reports one mailbox touched by a mark-read operation.
@@ -2054,12 +2291,14 @@ func (s *GlobalSummary) Err() error {
 // own mailbox().account() supplies the context. Messages from any mix of
 // accounts can be handled in one round trip.
 //
-// action: "read", "unread", "flag", "unflag", "delete", "move" (target is
-// the destination mailbox name within each message's own account) or
-// "archive". For archive, gmailPolicy decides what happens to messages in
-// Gmail accounts (which cannot be archived safely via scripting, see
-// ArchiveMessage): "skip" (default), "delete" (move to Trash, Gmail's own
-// delete semantics) or "read" (just mark read).
+// action: "read", "unread", "flag", "unflag", "quarantine" (target is the
+// holding mailbox name, created inside each message's own account when
+// missing), "move" (target is the destination mailbox name within each
+// message's own account) or "archive". For archive, gmailPolicy decides what
+// happens to messages in Gmail accounts (which cannot be archived safely via
+// scripting, see ArchiveMessage): "skip" (default) or "read" (just mark read).
+//
+// There is deliberately no "delete" action.
 func (c *Client) MutateMessagesGlobal(messageIDs []string, action, target, gmailPolicy string) (*GlobalSummary, error) {
 	idsJSON, _ := json.Marshal(messageIDs)
 	if gmailPolicy == "" {
@@ -2076,6 +2315,7 @@ const results = [];
 // Any container works for byId; the unified inbox is always present.
 const container = mail.inbox().messages;
 const archiveBoxes = {};
+const quarantineBoxes = {};
 const isGmail = {};
 for (const id of wanted) {
 	const r = { id: id, status: 'ok' };
@@ -2096,7 +2336,13 @@ for (const id of wanted) {
 		case 'unread': msg.readStatus = false; break;
 		case 'flag': msg.flaggedStatus = true; break;
 		case 'unflag': msg.flaggedStatus = false; break;
-		case 'delete': msg.delete(); break;
+		case 'quarantine': {
+			if (quarantineBoxes[accName] === undefined) quarantineBoxes[accName] = resolveMailbox(acc, target);
+			const dest = quarantineBoxes[accName];
+			if (!dest) throw 'Holding mailbox "' + target + '" is missing in ' + accName;
+			mail.move(msg, { to: dest });
+			break;
+		}
 		case 'move': {
 			const dest = resolveMailbox(acc, target);
 			if (!dest) throw 'Destination mailbox "' + target + '" not found in ' + accName;
@@ -2105,8 +2351,7 @@ for (const id of wanted) {
 		}
 		case 'archive': {
 			if (r.gmail) {
-				if (gmailPolicy === 'delete') { msg.delete(); }
-				else if (gmailPolicy === 'read') { msg.readStatus = true; }
+				if (gmailPolicy === 'read') { msg.readStatus = true; }
 				else { r.status = 'skipped'; r.error = 'Gmail accounts cannot be archived via Mail.app scripting'; }
 				break;
 			}

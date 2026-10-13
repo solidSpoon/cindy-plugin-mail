@@ -29,6 +29,7 @@ var (
 	msgNoCache       bool
 	msgForceRefresh  bool
 	msgGmailPolicy   string
+	msgQuarantineBox string
 )
 
 // sanitizeCacheKey replaces non-alphanumeric chars so the key is safe as a filename component.
@@ -266,26 +267,40 @@ var messagesFlagCmd = &cobra.Command{
 	},
 }
 
-var messagesDeleteCmd = &cobra.Command{
-	Use:   "delete [message-id...]",
-	Short: "Delete messages",
-	Long: `Move one or more messages to the trash. All IDs are processed in a single Mail.app call.
-Deleting a message that is already in Trash removes it permanently.` + globalHelp,
+var messagesQuarantineCmd = &cobra.Command{
+	Use:   "quarantine [message-id...]",
+	Short: "Park messages in a holding mailbox instead of deleting them",
+	Long: `Move one or more messages into a holding mailbox. Nothing is deleted: the
+messages stay in the mailbox and on the server, so the action is reversible
+from Mail.app at any time.
+
+The holding mailbox defaults to "` + mail.DefaultQuarantineMailbox + `" and is created inside each
+message's own account when it does not exist yet. Use --box to pick another
+name (for example --box "Archive Hold").
+
+Why not delete: Mail.app permanently empties each account's Trash on its own
+schedule (account properties "empty trash frequency" / "empty trash on
+quit"), so Trash is not a safe holding area.` + globalHelp,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		scoped, err := hasMailboxContext()
 		if err != nil {
 			return err
 		}
-		if !scoped {
-			return runGlobal(args, "delete", "", "deleted")
+		box := msgQuarantineBox
+		if box == "" {
+			box = mail.DefaultQuarantineMailbox
 		}
-		res, err := mail.NewClient().DeleteMessages(msgAccount, msgMailbox, args)
+		if !scoped {
+			return runGlobal(args, "quarantine", box, "quarantined in "+box)
+		}
+		res, err := mail.NewClient().QuarantineMessagesIn(msgAccount, msgMailbox, box, args)
 		if err != nil {
-			return fmt.Errorf("failed to delete messages: %w", err)
+			return fmt.Errorf("failed to quarantine messages: %w", err)
 		}
 		invalidateMailboxCache(msgAccount, msgMailbox)
-		return reportMutation(res, "deleted")
+		invalidateMailboxCache(msgAccount, box)
+		return reportMutation(res, "quarantined in "+box)
 	},
 }
 
@@ -294,14 +309,15 @@ var messagesArchiveCmd = &cobra.Command{
 	Short: "Archive messages",
 	Long: `Move one or more messages to the Archive mailbox. All IDs are processed in a single Mail.app call.
 Gmail accounts cannot be archived via Mail.app scripting (see README); --gmail
-chooses what happens to Gmail messages: skip (default, reported as skipped),
-delete (move to Trash) or read (mark as read and leave in place).` + globalHelp,
+chooses what happens to Gmail messages: skip (default, reported as skipped)
+or read (mark as read and leave in place). Use "messages quarantine" to park
+them in a holding mailbox instead.` + globalHelp,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		switch msgGmailPolicy {
-		case "skip", "delete", "read":
+		case "skip", "read":
 		default:
-			return fmt.Errorf("--gmail must be skip, delete or read")
+			return fmt.Errorf("--gmail must be skip or read")
 		}
 		scoped, err := hasMailboxContext()
 		if err != nil {
@@ -417,7 +433,7 @@ func init() {
 	messagesCmd.AddCommand(messagesShowCmd)
 	messagesCmd.AddCommand(messagesMarkCmd)
 	messagesCmd.AddCommand(messagesFlagCmd)
-	messagesCmd.AddCommand(messagesDeleteCmd)
+	messagesCmd.AddCommand(messagesQuarantineCmd)
 	messagesCmd.AddCommand(messagesArchiveCmd)
 	messagesCmd.AddCommand(messagesMoveCmd)
 	// Unified view subcommands
@@ -432,7 +448,8 @@ func init() {
 	// Common flags for all message commands
 	messagesCmd.PersistentFlags().StringVarP(&msgAccount, "account", "a", "", "Account name (required for list/show; optional for mutations)")
 	messagesCmd.PersistentFlags().StringVarP(&msgMailbox, "mailbox", "m", "", "Mailbox name (required for list/show; optional for mutations)")
-	messagesArchiveCmd.Flags().StringVar(&msgGmailPolicy, "gmail", "skip", "What to do with Gmail messages: skip, delete or read")
+	messagesArchiveCmd.Flags().StringVar(&msgGmailPolicy, "gmail", "skip", "What to do with Gmail messages: skip or read")
+	messagesQuarantineCmd.Flags().StringVar(&msgQuarantineBox, "box", "", "Holding mailbox to move messages into (created if missing; default \""+mail.DefaultQuarantineMailbox+"\")")
 
 	// List-specific flags
 	messagesListCmd.Flags().IntVarP(&msgLimit, "limit", "l", 25, "Maximum number of messages to display")

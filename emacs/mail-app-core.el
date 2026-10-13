@@ -80,10 +80,12 @@ If nil, you will be prompted to select one when needed."
   "What archiving does to messages in Gmail accounts.
 Mail.app offers no safe scriptable archive for Gmail (scripted moves out
 of INBOX revert on the next sync).  `skip' leaves them untouched and
-reports them; `delete' moves them to Trash (Gmail's own delete); `read'
-marks them read and leaves them in the inbox."
+reports them; `read' marks them read and leaves them in the inbox.
+
+Moving a Gmail message anywhere is a label change; use `messages
+quarantine' (key `d') to park it in a holding mailbox instead of deleting
+it."
   :type '(choice (const :tag "Skip and report" skip)
-                 (const :tag "Move to Trash" delete)
                  (const :tag "Mark read" read))
   :group 'mail-app)
 
@@ -323,7 +325,7 @@ Options:
     (define-key map (kbd "S") 'mail-app-search-all)
     (define-key map (kbd "f") 'mail-app-flag-message-at-point)
     (define-key map (kbd "F") 'mail-app-forward-message-at-point)
-    (define-key map (kbd "d") 'mail-app-delete-message-at-point)
+    (define-key map (kbd "d") 'mail-app-quarantine-message-at-point)
     (define-key map (kbd "a") 'mail-app-archive-message-at-point)
     (define-key map (kbd "!") 'mail-app-junk-message-at-point)
     (define-key map (kbd "v") 'mail-app-move-message-at-point)
@@ -340,7 +342,7 @@ Options:
     (define-key map (kbd "m") 'mail-app-toggle-mark-at-point)
     (define-key map (kbd "M") 'mail-app-toggle-mark-backward)
     (define-key map (kbd "U") 'mail-app-unmark-all)
-    (define-key map (kbd "x") 'mail-app-delete-marked)
+    (define-key map (kbd "x") 'mail-app-quarantine-marked)
     (define-key map (kbd ",a") 'mail-app-archive-marked)
     (define-key map (kbd ",f") 'mail-app-flag-marked)
     (define-key map (kbd ",j") 'mail-app-junk-marked)
@@ -364,7 +366,7 @@ Options:
     (define-key map (kbd "TAB") 'mail-app-cycle-view)
     (define-key map (kbd "<backtab>") 'mail-app-cycle-view-reverse)
     (define-key map (kbd "f") 'mail-app-flag-current-message)
-    (define-key map (kbd "d") 'mail-app-delete-current-message)
+    (define-key map (kbd "d") 'mail-app-quarantine-current-message)
     (define-key map (kbd "a") 'mail-app-archive-current-message)
     (define-key map (kbd "t") 'mail-app-mark-current-message)
     (define-key map (kbd "s") 'mail-app-save-attachment-at-point)
@@ -1309,7 +1311,8 @@ SORT-METHOD can be:
 
 ;; Custom send function for message-mode
 (defun mail-app--message-send-mail ()
-  "Send mail using mail-app-cli instead of default sendmail."
+  "Save mail as a Mail.app draft instead of using the default sendmail.
+Nothing is sent; review the draft in Mail.app and press Send there."
   (mail-app-send-message))
 
 

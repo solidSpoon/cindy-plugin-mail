@@ -21,7 +21,7 @@ and Mail.app answers them serially. Measured costs:
 ## How the CLI uses this
 
 - **Message lookup by ID** uses `byId()`. IDs are unique across the whole Mail
-  database, so no enumeration is needed; `messages show/mark/flag/delete/
+  database, so no enumeration is needed; `messages show/mark/flag/quarantine/
   archive/move` and attachment commands run in ~0.3 s regardless of mailbox size.
 - **Batch mutations** (`messages mark id1 id2 ...`) run in one `osascript`
   process: cost is one launch plus ~10 ms per message.
@@ -59,5 +59,5 @@ means it must be restarted.
 
 ## Moves change message IDs
 
-When a message is moved (archive, move, delete) Mail assigns it a new ID in the
+When a message is moved (archive, move, quarantine) Mail assigns it a new ID in the
 destination mailbox. Re-list the destination if you need to act on it again.
