@@ -6,24 +6,13 @@ import (
 	"github.com/intelligrit/mail-app-cli/pkg/mail"
 )
 
+// boolOr resolves an optional flag: absent means "leave it alone" at the call
+// site, and the caller passes the action's default.
 func boolOr(ptr *bool, def bool) bool {
 	if ptr == nil {
 		return def
 	}
 	return *ptr
-}
-
-// scoped reports whether a mutation should work through a known mailbox.
-// Giving one of account/mailbox but not the other is ambiguous.
-func scoped(account, mailbox string) (bool, *Error) {
-	if account == "" && mailbox == "" {
-		return false, nil
-	}
-	if account == "" || mailbox == "" {
-		return false, errf(CodeInvalidRequest,
-			"give both account and mailbox, or neither (ids are then resolved globally)")
-	}
-	return true, nil
 }
 
 // dryRunLocations answers "what would this touch?" without touching anything.
@@ -98,127 +87,139 @@ func quarantineError(err error) *Error {
 	return errf(CodeScriptFailed, "quarantine failed: %v", err)
 }
 
-// ------------------------------------------------------------------- mark
+// splitIDs reports a mutation's target mailbox, or nil for global resolution.
+// A MailboxRef always carries both fields, so "account without mailbox" is not
+// expressible and needs no runtime check any more.
+func splitRef(ref *MailboxRef) *mailboxRef {
+	if ref == nil {
+		return nil
+	}
+	return &mailboxRef{account: ref.Account, mailbox: ref.Mailbox}
+}
 
-type MessagesMarkReq struct {
-	base
-	IDs     []string `json:"ids" req:"1" desc:"Mail.app message ids"`
-	Read    *bool    `json:"read,omitempty" def:"true" desc:"true marks read, false marks unread"`
-	Account string   `json:"account,omitempty" desc:"with mailbox: look the ids up there instead of resolving them globally"`
-	Mailbox string   `json:"mailbox,omitempty"`
-	DryRun  bool     `json:"dryRun,omitempty" desc:"report what would change and change nothing"`
+type mailboxRef struct{ account, mailbox string }
+
+// ------------------------------------------------------------ messages.patch
+
+type MessagesPatchParams struct {
+	IDs    []string    `json:"ids" req:"1" desc:"Mail.app message ids; all of them are handled in one call"`
+	In     *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
+	Set    StateSet    `json:"set" req:"1" desc:"the flags to set; a field left out is left untouched"`
+	DryRun bool        `json:"dryRun,omitempty" desc:"report what would change and change nothing"`
 }
 
 func init() {
-	Register("messages.mark", "Mark messages read or unread in one Mail.app call", func(req MessagesMarkReq) (any, error) {
-		read := boolOr(req.Read, true)
+	Register("messages.patch", "Set read/flagged state on messages in one Mail.app call", func(req MessagesPatchParams) (any, error) {
+		if req.Set.Empty() {
+			return nil, errf(CodeInvalidRequest, "messages.patch: set must name read and/or flagged")
+		}
 		if req.DryRun {
 			return dryRunLocations(req.IDs)
 		}
-		isScoped, e := scoped(req.Account, req.Mailbox)
-		if e != nil {
-			return nil, e
-		}
-		verb := "marked read"
-		if !read {
-			verb = "marked unread"
-		}
+		ref := splitRef(req.In)
 		client := mail.NewClient()
-		if isScoped {
-			res, err := client.MarkMessages(req.Account, req.Mailbox, req.IDs, read)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "mark failed: %v", err)
+		out := map[string]any{}
+
+		if req.Set.Read != nil {
+			read := *req.Set.Read
+			verb := "marked read"
+			if !read {
+				verb = "marked unread"
 			}
-			invalidateMailboxCache(req.Account, req.Mailbox)
-			return mutationData(res, verb)
+			if ref != nil {
+				res, err := client.MarkMessages(ref.account, ref.mailbox, req.IDs, read)
+				if err != nil {
+					return nil, errf(CodeScriptFailed, "mark failed: %v", err)
+				}
+				data, e := mutationData(res, verb)
+				out["read"] = data
+				if e != nil && out["error"] == nil {
+					out["error"] = e.Error()
+				}
+				invalidateMailboxCache(ref.account, ref.mailbox)
+			} else {
+				action := "read"
+				if !read {
+					action = "unread"
+				}
+				sum, err := client.MutateMessagesGlobal(req.IDs, action, "", "")
+				if err != nil {
+					return nil, errf(CodeScriptFailed, "mark failed: %v", err)
+				}
+				data, e := globalData(sum, verb)
+				out["read"] = data
+				if e != nil && out["error"] == nil {
+					out["error"] = e.Error()
+				}
+			}
 		}
-		action := "read"
-		if !read {
-			action = "unread"
+
+		if req.Set.Flagged != nil {
+			flagged := *req.Set.Flagged
+			verb := "flagged"
+			if !flagged {
+				verb = "unflagged"
+			}
+			if ref != nil {
+				res, err := client.FlagMessages(ref.account, ref.mailbox, req.IDs, flagged)
+				if err != nil {
+					return nil, errf(CodeScriptFailed, "flag failed: %v", err)
+				}
+				data, e := mutationData(res, verb)
+				out["flagged"] = data
+				if e != nil && out["error"] == nil {
+					out["error"] = e.Error()
+				}
+				invalidateMailboxCache(ref.account, ref.mailbox)
+			} else {
+				action := "flag"
+				if !flagged {
+					action = "unflag"
+				}
+				sum, err := client.MutateMessagesGlobal(req.IDs, action, "", "")
+				if err != nil {
+					return nil, errf(CodeScriptFailed, "flag failed: %v", err)
+				}
+				data, e := globalData(sum, verb)
+				out["flagged"] = data
+				if e != nil && out["error"] == nil {
+					out["error"] = e.Error()
+				}
+			}
 		}
-		sum, err := client.MutateMessagesGlobal(req.IDs, action, "", "")
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "mark failed: %v", err)
+
+		if msg, ok := out["error"].(string); ok {
+			delete(out, "error")
+			return out, errf(CodePartialFailure, "%s", msg)
 		}
-		return globalData(sum, verb)
+		return out, nil
 	})
 }
 
-// ------------------------------------------------------------------- flag
+// ------------------------------------------------------------- messages.move
 
-type MessagesFlagReq struct {
-	base
-	IDs     []string `json:"ids" req:"1" desc:"Mail.app message ids"`
-	Flagged *bool    `json:"flagged,omitempty" def:"true" desc:"true flags, false unflags"`
-	Account string   `json:"account,omitempty"`
-	Mailbox string   `json:"mailbox,omitempty"`
-	DryRun  bool     `json:"dryRun,omitempty"`
+type MessagesMoveParams struct {
+	IDs    []string    `json:"ids" req:"1"`
+	To     string      `json:"to" req:"1" desc:"destination mailbox name inside each message's own account"`
+	In     *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
+	DryRun bool        `json:"dryRun,omitempty"`
 }
 
 func init() {
-	Register("messages.flag", "Flag or unflag messages in one Mail.app call", func(req MessagesFlagReq) (any, error) {
-		flagged := boolOr(req.Flagged, true)
+	Register("messages.move", "Move messages to another mailbox. The moved messages get new ids in the destination", func(req MessagesMoveParams) (any, error) {
 		if req.DryRun {
 			return dryRunLocations(req.IDs)
 		}
-		isScoped, e := scoped(req.Account, req.Mailbox)
-		if e != nil {
-			return nil, e
-		}
-		verb := "flagged"
-		if !flagged {
-			verb = "unflagged"
-		}
-		client := mail.NewClient()
-		if isScoped {
-			res, err := client.FlagMessages(req.Account, req.Mailbox, req.IDs, flagged)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "flag failed: %v", err)
-			}
-			invalidateMailboxCache(req.Account, req.Mailbox)
-			return mutationData(res, verb)
-		}
-		action := "flag"
-		if !flagged {
-			action = "unflag"
-		}
-		sum, err := client.MutateMessagesGlobal(req.IDs, action, "", "")
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "flag failed: %v", err)
-		}
-		return globalData(sum, verb)
-	})
-}
-
-// ------------------------------------------------------------------- move
-
-type MessagesMoveReq struct {
-	base
-	IDs     []string `json:"ids" req:"1"`
-	To      string   `json:"to" req:"1" desc:"destination mailbox name inside the message's own account"`
-	Account string   `json:"account,omitempty"`
-	Mailbox string   `json:"mailbox,omitempty"`
-	DryRun  bool     `json:"dryRun,omitempty"`
-}
-
-func init() {
-	Register("messages.move", "Move messages to another mailbox", func(req MessagesMoveReq) (any, error) {
-		if req.DryRun {
-			return dryRunLocations(req.IDs)
-		}
-		isScoped, e := scoped(req.Account, req.Mailbox)
-		if e != nil {
-			return nil, e
-		}
+		ref := splitRef(req.In)
 		client := mail.NewClient()
 		verb := "moved to " + req.To
-		if isScoped {
-			res, err := client.MoveMessages(req.Account, req.Mailbox, req.IDs, req.To)
+		if ref != nil {
+			res, err := client.MoveMessages(ref.account, ref.mailbox, req.IDs, req.To)
 			if err != nil {
 				return nil, errf(CodeScriptFailed, "move failed: %v", err)
 			}
-			invalidateMailboxCache(req.Account, req.Mailbox)
-			invalidateMailboxCache(req.Account, req.To)
+			invalidateMailboxCache(ref.account, ref.mailbox)
+			invalidateMailboxCache(ref.account, req.To)
 			return mutationData(res, verb)
 		}
 		sum, err := client.MutateMessagesGlobal(req.IDs, "move", req.To, "")
@@ -229,34 +230,29 @@ func init() {
 	})
 }
 
-// ---------------------------------------------------------------- archive
+// ---------------------------------------------------------- messages.archive
 
-type MessagesArchiveReq struct {
-	base
-	IDs         []string `json:"ids" req:"1"`
-	Account     string   `json:"account,omitempty"`
-	Mailbox     string   `json:"mailbox,omitempty"`
-	GmailPolicy string   `json:"gmailPolicy,omitempty" enum:"skip|read" def:"skip" desc:"what to do with Gmail messages, which Mail.app cannot archive safely"`
-	DryRun      bool     `json:"dryRun,omitempty"`
+type MessagesArchiveParams struct {
+	IDs         []string    `json:"ids" req:"1"`
+	In          *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
+	GmailPolicy string      `json:"gmailPolicy,omitempty" enum:"skip|read" def:"skip" desc:"what to do with Gmail messages, which Mail.app cannot archive safely"`
+	DryRun      bool        `json:"dryRun,omitempty"`
 }
 
 func init() {
-	Register("messages.archive", "Move messages to the account's Archive mailbox", func(req MessagesArchiveReq) (any, error) {
+	Register("messages.archive", "Move messages to the account's Archive mailbox", func(req MessagesArchiveParams) (any, error) {
 		if req.DryRun {
 			return dryRunLocations(req.IDs)
 		}
-		isScoped, e := scoped(req.Account, req.Mailbox)
-		if e != nil {
-			return nil, e
-		}
+		ref := splitRef(req.In)
 		client := mail.NewClient()
-		if isScoped {
-			res, err := client.ArchiveMessages(req.Account, req.Mailbox, req.IDs)
+		if ref != nil {
+			res, err := client.ArchiveMessages(ref.account, ref.mailbox, req.IDs)
 			if err != nil {
 				return nil, archiveError(err)
 			}
-			invalidateMailboxCache(req.Account, req.Mailbox)
-			invalidateMailboxCache(req.Account, "Archive")
+			invalidateMailboxCache(ref.account, ref.mailbox)
+			invalidateMailboxCache(ref.account, "Archive")
 			return mutationData(res, "archived")
 		}
 		sum, err := client.MutateMessagesGlobal(req.IDs, "archive", "", req.GmailPolicy)
@@ -267,38 +263,33 @@ func init() {
 	})
 }
 
-// ------------------------------------------------------------- quarantine
+// ------------------------------------------------------- messages.quarantine
 
-type MessagesQuarantineReq struct {
-	base
-	IDs     []string `json:"ids" req:"1"`
-	Box     string   `json:"box,omitempty" desc:"holding mailbox name, created in each account when missing"`
-	Account string   `json:"account,omitempty"`
-	Mailbox string   `json:"mailbox,omitempty"`
-	DryRun  bool     `json:"dryRun,omitempty"`
+type MessagesQuarantineParams struct {
+	IDs    []string    `json:"ids" req:"1"`
+	Box    string      `json:"box,omitempty" desc:"holding mailbox name, created in each account when missing"`
+	In     *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
+	DryRun bool        `json:"dryRun,omitempty"`
 }
 
 func init() {
-	Register("messages.quarantine", "Park messages in a holding mailbox. This is the safe replacement for deleting: nothing is destroyed and the move is reversible from Mail.app", func(req MessagesQuarantineReq) (any, error) {
+	Register("messages.quarantine", "Park messages in a holding mailbox. This is the safe replacement for deleting: nothing is destroyed and the move is reversible from Mail.app", func(req MessagesQuarantineParams) (any, error) {
 		if req.DryRun {
 			return dryRunLocations(req.IDs)
 		}
-		isScoped, e := scoped(req.Account, req.Mailbox)
-		if e != nil {
-			return nil, e
-		}
+		ref := splitRef(req.In)
 		box := req.Box
 		if box == "" {
 			box = mail.DefaultQuarantineMailbox
 		}
 		client := mail.NewClient()
-		if isScoped {
-			res, err := client.QuarantineMessagesIn(req.Account, req.Mailbox, box, req.IDs)
+		if ref != nil {
+			res, err := client.QuarantineMessagesIn(ref.account, ref.mailbox, box, req.IDs)
 			if err != nil {
 				return nil, quarantineError(err)
 			}
-			invalidateMailboxCache(req.Account, req.Mailbox)
-			invalidateMailboxCache(req.Account, box)
+			invalidateMailboxCache(ref.account, ref.mailbox)
+			invalidateMailboxCache(ref.account, box)
 			invalidateMailboxListCache()
 			return mutationData(res, "quarantined in "+box)
 		}
@@ -311,59 +302,66 @@ func init() {
 	})
 }
 
-// ------------------------------------------------------------ mark mailbox
+// ------------------------------------------------------- mailboxes.markRead
 
-type MailboxesMarkReadReq struct {
-	base
-	Account []string `json:"account,omitempty" desc:"limit to these accounts (repeatable)"`
-	Mailbox string   `json:"mailbox,omitempty" desc:"one mailbox; requires exactly one account"`
-	Trash   bool     `json:"trash,omitempty" desc:"every account's Trash / Deleted Items"`
-	Junk    bool     `json:"junk,omitempty" desc:"every account's Junk / Spam"`
-	Archive bool     `json:"archive,omitempty" desc:"every account's Archive mailbox"`
-	All     bool     `json:"all,omitempty" desc:"shorthand for trash+junk+archive"`
-	Unread  bool     `json:"unread,omitempty" desc:"mark unread instead of read"`
-	DryRun  bool     `json:"dryRun,omitempty" desc:"only count what would change"`
+type MailboxesMarkReadParams struct {
+	Select MarkSelect `json:"select" req:"1" desc:"which mailboxes to cover"`
+	Unread bool       `json:"unread,omitempty" desc:"mark unread instead of read"`
+	DryRun bool       `json:"dryRun,omitempty" desc:"only count what would change"`
+}
+
+// resolveMarkSelect turns the union into the engine's two call shapes, rejecting
+// the combinations the union exists to make impossible.
+func resolveMarkSelect(sel MarkSelect) (account, mailbox string, kinds []string, accounts []string, err *Error) {
+	switch sel.Mode {
+	case "mailbox":
+		if sel.Account == "" || sel.Mailbox == "" {
+			return "", "", nil, nil, errf(CodeInvalidRequest,
+				"select.mode=mailbox requires account and mailbox")
+		}
+		if len(sel.Kinds) > 0 || len(sel.Accounts) > 0 {
+			return "", "", nil, nil, errf(CodeInvalidRequest,
+				"select.mode=mailbox does not take kinds or accounts")
+		}
+		return sel.Account, sel.Mailbox, nil, nil, nil
+	case "special":
+		if len(sel.Kinds) == 0 {
+			return "", "", nil, nil, errf(CodeInvalidRequest,
+				"select.mode=special requires kinds (trash, junk and/or archive)")
+		}
+		if sel.Account != "" || sel.Mailbox != "" {
+			return "", "", nil, nil, errf(CodeInvalidRequest,
+				"select.mode=special does not take account or mailbox; use accounts to limit them")
+		}
+		return "", "", sel.Kinds, sel.Accounts, nil
+	default:
+		return "", "", nil, nil, errf(CodeInvalidRequest,
+			"select.mode must be mailbox or special (got %q)", sel.Mode)
+	}
 }
 
 func init() {
-	Register("mailboxes.markRead", "Mark every message in whole mailboxes read (or unread)", func(req MailboxesMarkReadReq) (any, error) {
-		if req.All {
-			req.Trash, req.Junk, req.Archive = true, true, true
+	Register("mailboxes.markRead", "Mark every message in whole mailboxes read (or unread)", func(req MailboxesMarkReadParams) (any, error) {
+		account, mailbox, kinds, accounts, e := resolveMarkSelect(req.Select)
+		if e != nil {
+			return nil, e
 		}
-		kinds := []string{}
-		if req.Trash {
-			kinds = append(kinds, "trash")
-		}
-		if req.Junk {
-			kinds = append(kinds, "junk")
-		}
-		if req.Archive {
-			kinds = append(kinds, "archive")
-		}
-
 		client := mail.NewClient()
 		read := !req.Unread
+
 		var results []mail.MailboxMarkResult
-		switch {
-		case req.Mailbox != "" && len(kinds) > 0:
-			return nil, errf(CodeInvalidRequest, "mailbox cannot be combined with trash/junk/archive/all")
-		case req.Mailbox != "":
-			if len(req.Account) != 1 {
-				return nil, errf(CodeInvalidRequest, "mailbox requires exactly one account")
-			}
-			changed, err := client.MarkMailboxRead(req.Account[0], req.Mailbox, read, req.DryRun)
+		if mailbox != "" {
+			changed, err := client.MarkMailboxRead(account, mailbox, read, req.DryRun)
 			if err != nil {
-				return nil, errf(CodeScriptFailed, "failed to mark %s/%s: %v", req.Account[0], req.Mailbox, err)
+				return nil, errf(CodeScriptFailed, "failed to mark %s/%s: %v", account, mailbox, err)
 			}
-			results = []mail.MailboxMarkResult{{Account: req.Account[0], Mailbox: req.Mailbox, Changed: changed}}
-		case len(kinds) > 0:
+			results = []mail.MailboxMarkResult{{Account: account, Mailbox: mailbox, Changed: changed}}
+		} else {
 			var err error
-			results, err = client.MarkSpecialMailboxesRead(kinds, req.Account, read, req.DryRun)
+			results, err = client.MarkSpecialMailboxesRead(kinds, accounts, read, req.DryRun)
 			if err != nil {
 				return nil, errf(CodeScriptFailed, "failed to mark mailboxes: %v", err)
 			}
-		default:
-			return nil, errf(CodeInvalidRequest, "give mailbox with one account, or one of trash/junk/archive/all")
 		}
 
 		total := 0
@@ -384,9 +382,7 @@ func init() {
 		if !read {
 			verb = "marked unread"
 		}
-		data := map[string]any{
-			"verb": verb, "changed": total, "mailboxes": results,
-		}
+		data := map[string]any{"verb": verb, "changed": total, "mailboxes": results}
 		if len(failures) > 0 {
 			return data, errf(CodePartialFailure, "%d mailboxes failed: %s",
 				len(failures), strings.Join(failures, "; "))
@@ -397,45 +393,47 @@ func init() {
 
 // ------------------------------------------------------------------ draft
 
-type DraftReq struct {
-	base
-	Account string   `json:"account,omitempty" desc:"account to draft from; inferred from from, or the only account, when omitted"`
-	From    string   `json:"from,omitempty" desc:"From address, e.g. \"名字 <a@b.com>\""`
-	To      []string `json:"to" req:"1" desc:"To recipients"`
-	Cc      []string `json:"cc,omitempty"`
-	Bcc     []string `json:"bcc,omitempty"`
+// DraftContent is the body half of a draft.
+type DraftContent struct {
 	Subject string   `json:"subject" req:"1"`
-	Body    string   `json:"body,omitempty" desc:"plain-text body; newlines are fine, nothing needs shell escaping"`
+	Body    string   `json:"body,omitempty" desc:"plain-text body; newlines and quotes need no escaping, it is JSON"`
 	Attach  []string `json:"attach,omitempty" desc:"file paths to attach"`
-	DryRun  bool     `json:"dryRun,omitempty" desc:"report what would be composed without creating the draft"`
+}
+
+type DraftParams struct {
+	Account    string       `json:"account,omitempty" desc:"account to draft from; inferred from from, or the only account, when omitted"`
+	From       string       `json:"from,omitempty" desc:"From address, e.g. \"名字 <a@b.com>\""`
+	Recipients Recipients   `json:"recipients" req:"1" desc:"who the message is addressed to"`
+	Content    DraftContent `json:"content" req:"1" desc:"subject, body and attachments"`
+	DryRun     bool         `json:"dryRun,omitempty" desc:"report what would be composed without creating the draft"`
 }
 
 func init() {
-	Register("draft", "Compose a message into Mail.app's Drafts mailbox. Nothing is sent: the user reviews it and presses Send in Mail.app. This tool has no way to send mail", func(req DraftReq) (any, error) {
+	Register("draft", "Compose a message into Mail.app's Drafts mailbox. Nothing is sent: the user reviews it and presses Send in Mail.app. This tool has no way to send mail", func(req DraftParams) (any, error) {
 		if req.DryRun {
 			return map[string]any{
 				"dryRun":      true,
 				"account":     req.Account,
-				"to":          req.To,
-				"cc":          req.Cc,
-				"bcc":         req.Bcc,
-				"subject":     req.Subject,
-				"bodyBytes":   len(req.Body),
-				"attachments": len(req.Attach),
+				"to":          req.Recipients.To,
+				"cc":          req.Recipients.Cc,
+				"bcc":         req.Recipients.Bcc,
+				"subject":     req.Content.Subject,
+				"bodyBytes":   len(req.Content.Body),
+				"attachments": len(req.Content.Attach),
 			}, nil
 		}
 		client := mail.NewClient()
 		account := req.Account
 		if account == "" && req.From != "" {
-			if acc, err := mail.NewClient().GetAccountsJSON(); err == nil {
-				account = matchAccount(acc, req.From)
+			if accounts, err := client.GetAccountsJSON(); err == nil {
+				account = matchAccount(accounts, req.From)
 			}
 		}
 		if account == "" {
 			return nil, errf(CodeInvalidRequest, "account is required (or give from matching a configured account)")
 		}
-		result, err := client.SaveDraft(account, req.From, req.Subject, req.Body,
-			req.To, req.Cc, req.Bcc, req.Attach)
+		result, err := client.SaveDraft(account, req.From, req.Content.Subject, req.Content.Body,
+			req.Recipients.To, req.Recipients.Cc, req.Recipients.Bcc, req.Content.Attach)
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to save draft: %v", err)
 		}
@@ -471,13 +469,12 @@ func matchAccount(accounts []mail.Account, from string) string {
 
 // ------------------------------------------------------------- sync, open
 
-type SyncReq struct {
-	base
+type SyncParams struct {
 	Account string `json:"account,omitempty" desc:"sync one account; omit to sync every account"`
 }
 
 func init() {
-	Register("sync", "Ask Mail.app to check for new mail now", func(req SyncReq) (any, error) {
+	Register("sync", "Ask Mail.app to check for new mail now", func(req SyncParams) (any, error) {
 		client := mail.NewClient()
 		if req.Account != "" {
 			if err := client.SyncAccount(req.Account); err != nil {
@@ -492,18 +489,29 @@ func init() {
 	})
 }
 
-type OpenReq struct {
-	base
-	ID      string `json:"id,omitempty" desc:"message id to reveal"`
-	Account string `json:"account,omitempty"`
-	Mailbox string `json:"mailbox,omitempty"`
+type OpenParams struct {
+	Message *OpenTarget `json:"message,omitempty" desc:"reveal this message; omit to just activate Mail.app"`
+}
+
+// OpenTarget is deliberately loose: showing a mailbox is useful on its own, and
+// without an id it only needs the mailbox.
+type OpenTarget struct {
+	In *MailboxRef `json:"in,omitempty"`
+	ID string      `json:"id,omitempty" desc:"message id to reveal"`
 }
 
 func init() {
-	Register("open", "Activate Mail.app, optionally focusing a mailbox or message. Useful to hand a message to the user", func(req OpenReq) (any, error) {
-		if err := mail.NewClient().OpenInMail(req.Account, req.Mailbox, req.ID); err != nil {
+	Register("open", "Activate Mail.app, optionally focusing a mailbox or message. Useful to hand a message to the user", func(req OpenParams) (any, error) {
+		var account, mailbox, id string
+		if req.Message != nil {
+			id = req.Message.ID
+			if req.Message.In != nil {
+				account, mailbox = req.Message.In.Account, req.Message.In.Mailbox
+			}
+		}
+		if err := mail.NewClient().OpenInMail(account, mailbox, id); err != nil {
 			return nil, errf(CodeScriptFailed, "failed to open Mail.app: %v", err)
 		}
-		return map[string]any{"opened": true, "account": req.Account, "mailbox": req.Mailbox, "id": req.ID}, nil
+		return map[string]any{"opened": true, "account": account, "mailbox": mailbox, "id": id}, nil
 	})
 }

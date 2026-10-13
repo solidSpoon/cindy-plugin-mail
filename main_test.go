@@ -56,7 +56,7 @@ func TestEmptyInputPrintsHelpAndFails(t *testing.T) {
 func TestMatchingAgainstASchemaWithoutMailApp(t *testing.T) {
 	// draft with dryRun never touches Mail.app, so it is safe to run here.
 	code, doc := invoke(t,
-		[]string{`{"action":"draft","to":["a@x.com"],"subject":"s","body":"b","dryRun":true}`}, "")
+		[]string{`{"action":"draft","params":{"recipients":{"to":["a@x.com"]},"content":{"subject":"s","body":"b"},"dryRun":true}}`}, "")
 	if code != 0 || doc["ok"] != true {
 		t.Fatalf("dry-run draft failed: code=%d doc=%v", code, doc)
 	}

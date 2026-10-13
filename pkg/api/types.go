@@ -83,14 +83,6 @@ type Response struct {
 	Error *Error `json:"error,omitempty"`
 }
 
-// base is embedded in every request struct so that document-level fields are
-// known to the strict decoder (which rejects unknown parameters) and can sit
-// next to "action" without being mistaken for operation parameters.
-type base struct {
-	Action string `json:"action"`
-	Pretty *bool  `json:"pretty,omitempty"`
-}
-
 // asError converts any error into a structured one, mapping the engine's
 // message text onto a stable code.
 func asError(err error) *Error {

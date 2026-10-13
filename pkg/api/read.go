@@ -54,23 +54,22 @@ func invalidateMailboxListCache() {
 
 // ---------------------------------------------------------------- schema
 
-type SchemaReq struct{ base }
+type SchemaParams struct{}
 
 func init() {
-	Register("schema", "Describe every action, its parameters and the tool's constraints", func(SchemaReq) (any, error) {
+	Register("schema", "Describe every action, its parameter object and the tool's constraints", func(SchemaParams) (any, error) {
 		return schemaData(), nil
 	})
 }
 
 // -------------------------------------------------------------- accounts
 
-type AccountsListReq struct {
-	base
+type AccountsListParams struct {
 	NoCache bool `json:"noCache,omitempty" desc:"bypass the cache and read Mail.app now"`
 }
 
 func init() {
-	Register("accounts.list", "List the Mail.app accounts", func(req AccountsListReq) (any, error) {
+	Register("accounts.list", "List the Mail.app accounts", func(req AccountsListParams) (any, error) {
 		var accounts []mail.Account
 		c, cacheErr := cache.New()
 		if !req.NoCache && cacheErr == nil {
@@ -93,8 +92,7 @@ func init() {
 
 // -------------------------------------------------------------- mailboxes
 
-type MailboxesListReq struct {
-	base
+type MailboxesListParams struct {
 	Account    string `json:"account,omitempty" desc:"limit to one account"`
 	Counts     bool   `json:"counts,omitempty" desc:"also read per-mailbox TotalCount (slower: enumerates each mailbox)"`
 	UnreadOnly bool   `json:"unreadOnly,omitempty" desc:"only mailboxes that currently have unread mail"`
@@ -102,7 +100,7 @@ type MailboxesListReq struct {
 }
 
 func init() {
-	Register("mailboxes.list", "List mailboxes with unread counts", func(req MailboxesListReq) (any, error) {
+	Register("mailboxes.list", "List mailboxes with unread counts", func(req MailboxesListParams) (any, error) {
 		cacheKey := "mailboxes"
 		if req.Account != "" {
 			cacheKey = "mailboxes-" + sanitizeCacheKey(req.Account)
@@ -119,7 +117,7 @@ func init() {
 		cached := false
 		if !req.NoCache && cacheErr == nil {
 			c.SetTTL(mailboxesCacheTTL)
-			if found, err := c.Get(cacheKey, &mailboxes); err == nil && found {
+			if found, gerr := c.Get(cacheKey, &mailboxes); gerr == nil && found {
 				cached = true
 			}
 		}
@@ -189,8 +187,7 @@ func projectMessages(messages []mail.Message, format string) any {
 	return out
 }
 
-type MessagesListReq struct {
-	base
+type MessagesListParams struct {
 	Account     string `json:"account" req:"1" desc:"account name, e.g. \"Exchange\""`
 	Mailbox     string `json:"mailbox" req:"1" desc:"mailbox name inside that account, e.g. \"收件箱\""`
 	Unread      bool   `json:"unread,omitempty" desc:"only unread messages"`
@@ -205,7 +202,7 @@ type MessagesListReq struct {
 }
 
 func init() {
-	Register("messages.list", "List messages in one mailbox", func(req MessagesListReq) (any, error) {
+	Register("messages.list", "List messages in one mailbox", func(req MessagesListParams) (any, error) {
 		if req.Limit <= 0 {
 			req.Limit = 25
 		}
@@ -222,7 +219,7 @@ func init() {
 		cached := false
 		if !req.NoCache && cacheErr == nil && !req.WithContent {
 			c.SetTTL(messagesCacheTTL)
-			if found, err := c.Get(cacheKey, &messages); err == nil && found {
+			if found, gerr := c.Get(cacheKey, &messages); gerr == nil && found {
 				cached = true
 			}
 		}
@@ -245,29 +242,27 @@ func init() {
 	})
 }
 
-type MessagesShowReq struct {
-	base
-	ID      string `json:"id" req:"1" desc:"Mail.app message id"`
-	Account string `json:"account" req:"1"`
-	Mailbox string `json:"mailbox" req:"1" desc:"the mailbox the message is currently in"`
+type MessagesShowParams struct {
+	Message MessageInMailbox `json:"message" req:"1"`
 }
 
 func init() {
-	Register("messages.show", "Show one message in full, including its body and thread headers", func(req MessagesShowReq) (any, error) {
-		message, err := mail.NewClient().GetMessageDetailsJSON(req.Account, req.Mailbox, req.ID)
+	Register("messages.show", "Show one message in full, including its body and thread headers", func(req MessagesShowParams) (any, error) {
+		in := req.Message.In
+		message, err := mail.NewClient().GetMessageDetailsJSON(in.Account, in.Mailbox, req.Message.ID)
 		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to read message %s: %v", req.ID, err)
+			return nil, errf(CodeScriptFailed, "failed to read message %s: %v", req.Message.ID, err)
 		}
 		if message.ID == "" {
-			return nil, errf(CodeMessageMissing, "no message %s in %s/%s", req.ID, req.Account, req.Mailbox).
+			return nil, errf(CodeMessageMissing, "no message %s in %s/%s",
+				req.Message.ID, in.Account, in.Mailbox).
 				withHint("re-list the mailbox first: mutations assign new ids")
 		}
 		return map[string]any{"message": message}, nil
 	})
 }
 
-type MessagesUnifiedReq struct {
-	base
+type MessagesUnifiedParams struct {
 	Box         string `json:"box" req:"1" enum:"inbox|unread|flagged|sent|drafts|trash|junk" desc:"which cross-account view to read"`
 	Since       string `json:"since,omitempty" desc:"only messages received at or after this date: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"`
 	Limit       int    `json:"limit,omitempty" def:"25" desc:"maximum messages to return"`
@@ -278,7 +273,7 @@ type MessagesUnifiedReq struct {
 }
 
 func init() {
-	Register("messages.unified", "Read one cross-account view (inbox, unread, flagged, sent, drafts, trash, junk)", func(req MessagesUnifiedReq) (any, error) {
+	Register("messages.unified", "Read one cross-account view (inbox, unread, flagged, sent, drafts, trash, junk)", func(req MessagesUnifiedParams) (any, error) {
 		if req.Limit <= 0 {
 			req.Limit = 25
 		}
@@ -294,8 +289,7 @@ func init() {
 	})
 }
 
-type MessagesSearchReq struct {
-	base
+type MessagesSearchParams struct {
 	Query   string `json:"query" req:"1" desc:"matched against subject and sender; bodies are not searched"`
 	Account string `json:"account,omitempty" desc:"limit to one account"`
 	Mailbox string `json:"mailbox,omitempty" desc:"limit to one mailbox; requires account"`
@@ -304,7 +298,7 @@ type MessagesSearchReq struct {
 }
 
 func init() {
-	Register("messages.search", "Search subject and sender across mailboxes", func(req MessagesSearchReq) (any, error) {
+	Register("messages.search", "Search subject and sender across mailboxes", func(req MessagesSearchParams) (any, error) {
 		if req.Limit <= 0 {
 			req.Limit = 50
 		}
@@ -322,13 +316,12 @@ func init() {
 	})
 }
 
-type MessagesResolveReq struct {
-	base
+type MessagesResolveParams struct {
 	IDs []string `json:"ids" req:"1" desc:"Mail.app message ids to locate"`
 }
 
 func init() {
-	Register("messages.resolve", "Report where message ids currently live, changing nothing", func(req MessagesResolveReq) (any, error) {
+	Register("messages.resolve", "Report where message ids currently live, changing nothing", func(req MessagesResolveParams) (any, error) {
 		locations, err := mail.NewClient().ResolveMessages(req.IDs)
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
@@ -347,16 +340,14 @@ func init() {
 
 // ------------------------------------------------------------ attachments
 
-type AttachmentsListReq struct {
-	base
-	ID      string `json:"id" req:"1" desc:"Mail.app message id"`
-	Account string `json:"account" req:"1"`
-	Mailbox string `json:"mailbox" req:"1"`
+type AttachmentsListParams struct {
+	Message MessageInMailbox `json:"message" req:"1" desc:"the message that carries the attachments"`
 }
 
 func init() {
-	Register("attachments.list", "List the attachments of one message", func(req AttachmentsListReq) (any, error) {
-		attachments, err := mail.NewClient().GetAttachmentsJSON(req.Account, req.Mailbox, req.ID)
+	Register("attachments.list", "List the attachments of one message", func(req AttachmentsListParams) (any, error) {
+		in := req.Message.In
+		attachments, err := mail.NewClient().GetAttachmentsJSON(in.Account, in.Mailbox, req.Message.ID)
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to list attachments: %v", err)
 		}
@@ -364,25 +355,23 @@ func init() {
 	})
 }
 
-type AttachmentsSaveReq struct {
-	base
-	ID      string `json:"id" req:"1"`
-	Account string `json:"account" req:"1"`
-	Mailbox string `json:"mailbox" req:"1"`
-	Name    string `json:"name" req:"1" desc:"attachment file name as reported by attachments.list"`
-	Output  string `json:"output,omitempty" desc:"destination path; defaults to the attachment name in the working directory"`
+type AttachmentsSaveParams struct {
+	Message MessageInMailbox `json:"message" req:"1"`
+	Name    string           `json:"name" req:"1" desc:"attachment file name as reported by attachments.list"`
+	Output  string           `json:"output,omitempty" desc:"destination path; defaults to the attachment name in the working directory"`
 }
 
 func init() {
-	Register("attachments.save", "Save one attachment to disk", func(req AttachmentsSaveReq) (any, error) {
+	Register("attachments.save", "Save one attachment to disk", func(req AttachmentsSaveParams) (any, error) {
+		in := req.Message.In
 		output := req.Output
 		if output == "" {
 			output = req.Name
 		}
-		if err := mail.NewClient().SaveAttachment(req.Account, req.Mailbox, req.ID, req.Name, output); err != nil {
+		if err := mail.NewClient().SaveAttachment(in.Account, in.Mailbox, req.Message.ID, req.Name, output); err != nil {
 			return nil, errf(CodeScriptFailed, "failed to save attachment %q: %v", req.Name, err).
 				withHint("confirm the name with attachments.list")
 		}
-		return map[string]any{"saved": output, "name": req.Name, "id": req.ID}, nil
+		return map[string]any{"saved": output, "name": req.Name, "id": req.Message.ID}, nil
 	})
 }

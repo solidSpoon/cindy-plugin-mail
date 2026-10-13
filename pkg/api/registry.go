@@ -3,28 +3,22 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
 )
 
-// Field is one parameter, as reported by the `schema` action.
-type Field struct {
-	Name     string   `json:"name"`
-	Type     string   `json:"type"`
-	Required bool     `json:"required,omitempty"`
-	Enum     []string `json:"enum,omitempty"`
-	Default  string   `json:"default,omitempty"`
-	Desc     string   `json:"desc,omitempty"`
-}
-
-// action is one capability: a request struct type plus its handler.
+// action is one capability: an action name, the type of its parameter object
+// and its handler. The parameter type is what makes the action and its inputs
+// separable — the decoder and the schema both work from it, so a parameter can
+// never exist for one and not the other.
 type action struct {
-	name    string
-	summary string
-	newReq  func() any
-	run     func(any) (any, error)
-	fields  []Field
+	name       string
+	summary    string
+	paramsType reflect.Type
+	newParams  func() any
+	run        func(any) (any, error)
 }
 
 var (
@@ -32,26 +26,32 @@ var (
 	actionNames []string
 )
 
-// Register wires a request type to a handler. Request structs embed `base` and
-// document themselves with `desc` (prose), `req:"1"` (required), `enum:"a|b"`
-// and `def` (default) tags; the `schema` action reports them verbatim, so the
-// schema cannot drift from the decoder.
-func Register[T any](name, summary string, run func(T) (any, error)) {
+// Register wires an action name to a parameter struct and a handler. Parameter
+// structs document themselves with `desc`, `req:"1"`, `enum:"a|b"` and `def`
+// tags; the schema reports them verbatim.
+func Register[P any](name, summary string, run func(P) (any, error)) {
 	if _, dup := registry[name]; dup {
 		panic("api: duplicate action " + name)
 	}
-	t := reflect.TypeOf(*new(T))
 	registry[name] = &action{
-		name:    name,
-		summary: summary,
-		newReq:  func() any { return new(T) },
+		name:       name,
+		summary:    summary,
+		paramsType: reflect.TypeOf(*new(P)),
+		newParams:  func() any { return new(P) },
 		run: func(v any) (any, error) {
-			return run(*(v.(*T)))
+			return run(*(v.(*P)))
 		},
-		fields: fieldsOf(t),
 	}
 	actionNames = append(actionNames, name)
 	sort.Strings(actionNames)
+}
+
+// operation is one action invocation. Parameters live in their own object so
+// that the shape of an action's inputs is independent of the action itself.
+type operation struct {
+	Action string          `json:"action"`
+	Params json.RawMessage `json:"params"`
+	Pretty *bool           `json:"pretty,omitempty"`
 }
 
 // Options are document-level settings rather than operations.
@@ -65,9 +65,10 @@ type Options struct {
 // Execute handles one request document and returns the envelope to print.
 func Execute(doc []byte) (Response, Options) {
 	var probe struct {
-		base
-		Ops    []json.RawMessage `json:"ops"`
+		Action string            `json:"action"`
+		Params json.RawMessage   `json:"params"`
 		Pretty *bool             `json:"pretty"`
+		Ops    []json.RawMessage `json:"ops"`
 	}
 	opts := Options{}
 	if err := json.Unmarshal(doc, &probe); err != nil {
@@ -105,39 +106,54 @@ func Execute(doc []byte) (Response, Options) {
 }
 
 func runOne(index int, raw json.RawMessage) Result {
-	var head base
-	if err := json.Unmarshal(raw, &head); err != nil {
-		return Result{Index: index, OK: false,
-			Error: errf(CodeInvalidRequest, "operation is not a JSON object: %v", err)}
+	var op operation
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// A stray parameter at this level is a caller that has not split params
+	// out, so it is refused rather than ignored.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&op); err != nil {
+		err := errf(CodeInvalidRequest, "operation is not valid: %v", err)
+		if !bytes.Contains(raw, []byte(`"params"`)) {
+			err = err.withHint(`parameters belong inside "params", e.g. {"action":"...","params":{...}}`)
+		}
+		return Result{Index: index, OK: false, Error: err}
 	}
-	a := registry[head.Action]
+
+	if strings.TrimSpace(op.Action) == "" {
+		return Result{Index: index, OK: false,
+			Error: errf(CodeInvalidRequest, "operation has no action")}
+	}
+	a := registry[op.Action]
 	if a == nil {
-		return Result{Index: index, Action: head.Action, OK: false,
-			Error: errf(CodeUnknownAction, "unknown action %q", head.Action).
+		return Result{Index: index, Action: op.Action, OK: false,
+			Error: errf(CodeUnknownAction, "unknown action %q", op.Action).
 				withHint(`call {"action":"schema"} for the full list`)}
 	}
 
 	res := Result{Index: index, Action: a.name}
-	req := a.newReq()
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	// Rejecting unknown fields turns a misspelled parameter into an error
-	// instead of a silently ignored default.
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(req); err != nil {
-		res.Error = errf(CodeInvalidRequest, "invalid parameters for %s: %v", a.name, err)
-		return res
+	params := a.newParams()
+	switch {
+	case len(op.Params) == 0:
+		if a.paramsType.NumField() > 0 {
+			return Result{Index: index, Action: a.name, OK: false,
+				Error: errf(CodeInvalidRequest, "%s requires a params object", a.name)}
+		}
+	default:
+		pdec := json.NewDecoder(bytes.NewReader(op.Params))
+		pdec.DisallowUnknownFields()
+		if err := pdec.Decode(params); err != nil {
+			return Result{Index: index, Action: a.name, OK: false,
+				Error: errf(CodeInvalidRequest, "invalid params for %s: %v", a.name, err)}
+		}
 	}
 
-	rv := reflect.ValueOf(req).Elem()
-	if e := validate(a, rv); e != nil {
-		res.Error = e
-		return res
+	rv := reflect.ValueOf(params).Elem()
+	if e := validateParams(a, rv, "params"); e != nil {
+		return Result{Index: index, Action: a.name, DryRun: dryRunOf(rv), OK: false, Error: e}
 	}
-	if f := rv.FieldByName("DryRun"); f.IsValid() && f.Kind() == reflect.Bool {
-		res.DryRun = f.Bool()
-	}
+	res.DryRun = dryRunOf(rv)
 
-	data, err := a.run(req)
+	data, err := a.run(params)
 	if data != nil {
 		// Data survives a partial failure so the caller can still see which ids
 		// were handled and which were not.
@@ -151,128 +167,95 @@ func runOne(index int, raw json.RawMessage) Result {
 	return res
 }
 
-func validate(a *action, rv reflect.Value) *Error {
+func dryRunOf(rv reflect.Value) bool {
+	if f := rv.FieldByName("DryRun"); f.IsValid() && f.Kind() == reflect.Bool {
+		return f.Bool()
+	}
+	return false
+}
+
+// validateParams walks a parameter object, including nested objects and their
+// elements, reporting the full path of the offending field.
+func validateParams(a *action, rv reflect.Value, path string) *Error {
 	t := rv.Type()
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if f.Anonymous {
+		if f.PkgPath != "" {
+			continue
+		}
+		if f.Anonymous && deref(f.Type).Kind() == reflect.Struct {
+			if e := validateParams(a, derefValue(rv.Field(i)), path); e != nil {
+				return e
+			}
 			continue
 		}
 		name := jsonNameOf(f)
-		fv := rv.Field(i)
-		if f.Tag.Get("req") == "1" {
-			empty := (fv.Kind() == reflect.String && strings.TrimSpace(fv.String()) == "") ||
-				(fv.Kind() == reflect.Slice && fv.Len() == 0)
-			if empty {
-				return errf(CodeInvalidRequest, "%s: required parameter %q is missing", a.name, name)
-			}
+		if name == "-" {
+			continue
 		}
-		if enum := f.Tag.Get("enum"); enum != "" && fv.Kind() == reflect.String {
-			got := fv.String()
-			if got == "" || contains(splitList(enum), got) {
+		fieldPath := path + "." + name
+		required := f.Tag.Get("req") == "1"
+		fv := rv.Field(i)
+
+		if fv.Kind() == reflect.Ptr {
+			if fv.IsNil() {
+				if required {
+					return errf(CodeInvalidRequest, "%s: required parameter %q is missing", a.name, fieldPath)
+				}
 				continue
 			}
-			return errf(CodeInvalidRequest, "%s: parameter %q must be one of %s (got %q)",
-				a.name, name, enum, got)
+			fv = fv.Elem()
+		}
+
+		switch fv.Kind() {
+		case reflect.String:
+			if required && strings.TrimSpace(fv.String()) == "" {
+				return errf(CodeInvalidRequest, "%s: required parameter %q is missing", a.name, fieldPath)
+			}
+			if enum := splitList(f.Tag.Get("enum")); enum != nil && fv.String() != "" {
+				if !contains(enum, fv.String()) {
+					return errf(CodeInvalidRequest, "%s: %q must be one of %s (got %q)",
+						a.name, fieldPath, strings.Join(enum, "|"), fv.String())
+				}
+			}
+		case reflect.Slice:
+			if required && fv.Len() == 0 {
+				return errf(CodeInvalidRequest, "%s: required parameter %q is missing", a.name, fieldPath)
+			}
+			elem := deref(fv.Type().Elem())
+			for j := 0; j < fv.Len(); j++ {
+				item := derefValue(fv.Index(j))
+				if enum := splitList(f.Tag.Get("enum")); enum != nil && item.Kind() == reflect.String {
+					if !contains(enum, item.String()) {
+						return errf(CodeInvalidRequest, "%s: %s[%d] must be one of %s (got %q)",
+							a.name, fieldPath, j, strings.Join(enum, "|"), item.String())
+					}
+				}
+				if elem.Kind() == reflect.Struct {
+					if e := validateParams(a, item, fmt.Sprintf("%s[%d]", fieldPath, j)); e != nil {
+						return e
+					}
+				}
+			}
+		case reflect.Struct:
+			if e := validateParams(a, fv, fieldPath); e != nil {
+				return e
+			}
 		}
 	}
 	return nil
 }
 
+func derefValue(v reflect.Value) reflect.Value {
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return v
+		}
+		v = v.Elem()
+	}
+	return v
+}
+
 func schemaData() any {
-	actions := make([]map[string]any, 0, len(actionNames))
-	for _, name := range actionNames {
-		a := registry[name]
-		actions = append(actions, map[string]any{
-			"name":    a.name,
-			"summary": a.summary,
-			"params":  a.fields,
-		})
-	}
-	return map[string]any{
-		"actions": actions,
-		"constraints": []string{
-			"no action sends mail: `draft` writes the message into Mail.app's Drafts mailbox for the user to review and send",
-			"no action deletes mail: `messages.quarantine` moves messages into a holding mailbox, which is reversible from Mail.app",
-			`every mutation accepts "dryRun": true, which reports what it would touch and changes nothing`,
-			"mutations take all ids in one call; with no account/mailbox the ids are resolved globally because Mail.app message ids are unique database-wide",
-			`list actions accept "format": "compact" to drop fields that are empty for the query` + "",
-		},
-		"input": []string{
-			"pass the request document as the first argument or on stdin",
-			`a document is either one operation ({"action":...}) or a batch ({"ops":[{"action":...},...]})`,
-			`document level settings sit next to "action": "pretty": true indents the output`,
-			"every operation reports ok/dryRun/data/error; unknown parameters are rejected rather than ignored",
-			"exit code is 0 when every operation succeeded, 1 otherwise; the envelope is always printed",
-		},
-	}
-}
-
-func fieldsOf(t reflect.Type) []Field {
-	fields := make([]Field, 0, t.NumField())
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if f.Anonymous {
-			continue
-		}
-		fields = append(fields, Field{
-			Name:     jsonNameOf(f),
-			Type:     goTypeOf(f.Type),
-			Required: f.Tag.Get("req") == "1",
-			Enum:     splitList(f.Tag.Get("enum")),
-			Default:  f.Tag.Get("def"),
-			Desc:     f.Tag.Get("desc"),
-		})
-	}
-	return fields
-}
-
-func jsonNameOf(f reflect.StructField) string {
-	name := strings.Split(f.Tag.Get("json"), ",")[0]
-	if name == "" {
-		name = f.Name
-	}
-	return name
-}
-
-func goTypeOf(t reflect.Type) string {
-	switch t.Kind() {
-	case reflect.String:
-		return "string"
-	case reflect.Bool:
-		return "bool"
-	case reflect.Int, reflect.Int64:
-		return "int"
-	case reflect.Slice:
-		return goTypeOf(t.Elem()) + "[]"
-	case reflect.Ptr:
-		return goTypeOf(t.Elem())
-	case reflect.Map, reflect.Struct:
-		return "object"
-	default:
-		return t.Kind().String()
-	}
-}
-
-func splitList(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, "|")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func contains(list []string, want string) bool {
-	for _, s := range list {
-		if s == want {
-			return true
-		}
-	}
-	return false
+	return newBuilder().schema()
 }

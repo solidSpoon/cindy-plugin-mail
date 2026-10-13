@@ -85,10 +85,10 @@ func helpDoc() any {
 		"version": version,
 		"usage": []string{
 			`mail-app-cli '{"action":"schema"}'`,
-			`mail-app-cli '{"action":"messages.unified","box":"unread","limit":10,"format":"compact"}'`,
+			`mail-app-cli '{"action":"messages.unified","params":{"box":"unread","limit":10,"format":"compact"}}'`,
 			`printf '%s' '{"ops":[...]}' | mail-app-cli`,
 		},
-		"input":       "one JSON request document, as the first argument or on stdin; either one operation or an ops array",
+		"input":       "one JSON request document, as the first argument or on stdin; an action plus its own params object, or an ops array of them",
 		"output":      "a JSON envelope on stdout, single-line by default; add \"pretty\": true to indent it; exit code 0 when every operation succeeded, 1 otherwise",
 		"constraints": []string{"no action sends mail", "no action deletes mail", "mutations accept dryRun:true"},
 		"next":        `call {"action":"schema"} to list every action and its parameters`,

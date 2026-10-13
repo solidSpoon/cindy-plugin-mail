@@ -9,44 +9,63 @@ import (
 )
 
 // These tests deliberately cover only the parts that do not talk to Mail.app:
-// request decoding, validation, the schema and the dry-run paths. Anything that
-// reaches Mail.app would need the user's live mailbox, so it is not exercised
-// here.
+// request decoding, parameter validation, the schema and the dry-run paths.
+// Anything that reaches Mail.app would need the user's live mailbox, so it is
+// exercised manually instead.
 
 func run(t *testing.T, doc string) (Response, Options) {
 	t.Helper()
 	return Execute([]byte(doc))
 }
 
-func TestSchemaDescribesEveryAction(t *testing.T) {
+func firstError(t *testing.T, doc string) *Error {
+	t.Helper()
+	resp, _ := run(t, doc)
+	if resp.OK {
+		t.Fatalf("%s should not have succeeded", doc)
+	}
+	if len(resp.Results) == 0 || resp.Results[0].Error == nil {
+		t.Fatalf("%s produced no operation error: %+v", doc, resp)
+	}
+	return resp.Results[0].Error
+}
+
+func schemaOf(t *testing.T) Schema {
+	t.Helper()
 	resp, _ := run(t, `{"action":"schema"}`)
-	if !resp.OK || len(resp.Results) != 1 {
-		t.Fatalf("schema did not run: %+v", resp)
+	if !resp.OK {
+		t.Fatalf("schema failed: %+v", resp)
 	}
-	data, ok := resp.Results[0].Data.(map[string]any)
-	if !ok {
-		t.Fatalf("schema data is %T, want object", resp.Results[0].Data)
+	raw, err := json.Marshal(resp.Results[0].Data)
+	if err != nil {
+		t.Fatal(err)
 	}
-	actions, ok := data["actions"].([]map[string]any)
-	if !ok {
-		t.Fatalf("actions is %T, want a slice", data["actions"])
+	var schema Schema
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatal(err)
 	}
-	if len(actions) != len(actionNames) {
-		t.Fatalf("schema has %d actions, registry has %d", len(actions), len(actionNames))
+	return schema
+}
+
+func TestSchemaDescribesEveryAction(t *testing.T) {
+	schema := schemaOf(t)
+	if len(schema.Actions) != len(actionNames) {
+		t.Fatalf("schema has %d actions, registry has %d", len(schema.Actions), len(actionNames))
 	}
-	for _, a := range actions {
-		name, _ := a["name"].(string)
-		if name == "" {
-			t.Errorf("action without a name: %+v", a)
+	for _, a := range schema.Actions {
+		if a.Name == "" || a.Summary == "" {
+			t.Errorf("incomplete action spec: %+v", a)
 		}
-		if summary, _ := a["summary"].(string); summary == "" {
-			t.Errorf("%s has no summary", name)
+		props, ok := a.Params["properties"].(map[string]any)
+		if !ok {
+			t.Errorf("%s has no params properties: %+v", a.Name, a.Params)
+			continue
 		}
-		if _, ok := a["params"].([]Field); !ok {
-			t.Errorf("%s params are %T, want []Field", name, a["params"])
+		if len(props) == 0 && a.Name != "schema" {
+			t.Errorf("%s documents no parameters", a.Name)
 		}
 	}
-	for _, want := range []string{"schema", "messages.list", "messages.quarantine", "draft"} {
+	for _, want := range []string{"schema", "messages.list", "messages.patch", "messages.quarantine", "draft"} {
 		if registry[want] == nil {
 			t.Errorf("action %q is not registered", want)
 		}
@@ -64,38 +83,52 @@ func TestSchemaNeverAdvertisesSendingOrDeleting(t *testing.T) {
 	}
 }
 
-func TestSchemaReportsRequiredAndEnumParams(t *testing.T) {
-	fields := map[string]Field{}
-	for _, f := range registry["messages.list"].fields {
-		fields[f.Name] = f
-	}
-	for _, name := range []string{"account", "mailbox"} {
-		if !fields[name].Required {
-			t.Errorf("messages.list.%s should be required", name)
+func TestSchemaSharesNestedTypesUnderDefs(t *testing.T) {
+	schema := schemaOf(t)
+	for _, want := range []string{"MailboxRef", "MessageInMailbox", "Recipients", "MarkSelect", "StateSet"} {
+		if _, ok := schema.Defs[want]; !ok {
+			t.Errorf("def %q is missing; shared parameter types should be described once", want)
 		}
 	}
-	if fields["format"].Enum == nil || !contains(fields["format"].Enum, "compact") {
-		t.Errorf("messages.list.format should advertise its enum, got %+v", fields["format"])
+	ref := schema.Defs["MailboxRef"]
+	if ref.Required == nil || len(ref.Required) != 2 {
+		t.Errorf("MailboxRef should require both fields, got %+v", ref)
 	}
-	if fields["limit"].Default != "25" {
-		t.Errorf("messages.list.limit default is %q, want 25", fields["limit"].Default)
-	}
-	if got := fields["unread"].Type; got != "bool" {
-		t.Errorf("messages.list.unread type is %q, want bool", got)
+	if note := schema.Defs["MarkSelect"].Note; !strings.Contains(note, "mode=mailbox") {
+		t.Errorf("MarkSelect should explain its union, got %q", note)
 	}
 
-	mark := map[string]Field{}
-	for _, f := range registry["messages.mark"].fields {
-		mark[f.Name] = f
+	// An action that takes a mailbox must point at the def rather than repeat
+	// its fields.
+	var list ActionSpec
+	for _, a := range schema.Actions {
+		if a.Name == "messages.list" {
+			list = a
+		}
 	}
-	// read is a *bool with a default, to tell "unset" from "false".
-	if mark["read"].Type != "bool" || mark["read"].Default != "true" {
-		t.Errorf("messages.mark.read is %+v, want an optional bool defaulting to true", mark["read"])
+	props := list.Params["properties"].(map[string]any)
+	account := props["account"].(map[string]any)
+	if account["type"] != "string" || account["required"] != true {
+		t.Errorf("messages.list.account should be a required string, got %+v", account)
+	}
+	if account["desc"] == "" {
+		t.Errorf("messages.list.account should carry its description")
+	}
+
+	var show ActionSpec
+	for _, a := range schema.Actions {
+		if a.Name == "messages.show" {
+			show = a
+		}
+	}
+	message := show.Params["properties"].(map[string]any)["message"].(map[string]any)
+	if message["ref"] != "MessageInMailbox" {
+		t.Errorf("messages.show.message should reference MessageInMailbox, got %+v", message)
 	}
 }
 
 func TestExecuteSingleOperation(t *testing.T) {
-	resp, opts := run(t, `{"action":"draft","account":"Google","to":["a@x.com"],"subject":"hi","body":"b","dryRun":true,"pretty":true}`)
+	resp, opts := run(t, `{"action":"draft","params":{"recipients":{"to":["a@x.com"]},"content":{"subject":"hi","body":"b"},"dryRun":true},"pretty":true}`)
 	if !resp.OK || resp.OKCount != 1 || resp.Failed != 0 {
 		t.Fatalf("unexpected envelope: %+v", resp)
 	}
@@ -107,11 +140,93 @@ func TestExecuteSingleOperation(t *testing.T) {
 	}
 }
 
+func TestParametersMustBeNestedUnderParams(t *testing.T) {
+	// The pre-split form: parameters sitting next to the action.
+	e := firstError(t, `{"action":"messages.list","account":"Exchange","mailbox":"收件箱"}`)
+	if e.Code != CodeInvalidRequest {
+		t.Errorf("code is %q, want %q", e.Code, CodeInvalidRequest)
+	}
+	if !strings.Contains(e.Hint, "params") {
+		t.Errorf("hint should point at the params wrapper, got %q", e.Hint)
+	}
+}
+
+func TestMissingParamsObjectIsReported(t *testing.T) {
+	e := firstError(t, `{"action":"messages.list"}`)
+	if !strings.Contains(e.Message, "requires a params object") {
+		t.Errorf("unexpected message: %q", e.Message)
+	}
+}
+
+func TestNestedRequiredFieldsAreNamed(t *testing.T) {
+	e := firstError(t, `{"action":"messages.show","params":{"message":{"id":"7847"}}}`)
+	if e.Code != CodeInvalidRequest {
+		t.Fatalf("code is %q, want %q", e.Code, CodeInvalidRequest)
+	}
+	if !strings.Contains(e.Message, "params.message.in") {
+		t.Errorf("error should give the nested path, got %q", e.Message)
+	}
+}
+
+func TestUnknownNestedParameterIsRejected(t *testing.T) {
+	e := firstError(t, `{"action":"messages.show","params":{"message":{"id":"1","in":{"account":"A","mailbox":"B","bogus":1}}}}`)
+	if !strings.Contains(e.Message, "bogus") {
+		t.Errorf("error should name the unknown field, got %q", e.Message)
+	}
+}
+
+func TestMarkSelectUnionRejectsMixedModes(t *testing.T) {
+	e := firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"mailbox","kind":"trash"}}}`)
+	if !strings.Contains(e.Message, "kind") {
+		t.Errorf("unknown field inside the union should be rejected, got %q", e.Message)
+	}
+
+	e = firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"mailbox","account":"Exchange"}}}`)
+	if !strings.Contains(e.Message, "mailbox") {
+		t.Errorf("mode=mailbox without mailbox should be rejected, got %q", e.Message)
+	}
+
+	e = firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"special","account":"Exchange","kinds":["trash"]}}}`)
+	if !strings.Contains(e.Message, "does not take account") {
+		t.Errorf("mode=special with account should be rejected, got %q", e.Message)
+	}
+
+	e = firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"nonsense"}}}`)
+	if !strings.Contains(e.Message, "mailbox|special") {
+		t.Errorf("mode should be validated as an enum, got %q", e.Message)
+	}
+}
+
+func TestEnumInsideSliceIsValidated(t *testing.T) {
+	e := firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"special","kinds":["trahs"]}}}`)
+	if !strings.Contains(e.Message, "trash|junk|archive") {
+		t.Errorf("kinds should be validated against its enum, got %q", e.Message)
+	}
+}
+
+func TestUnknownActionAndUnknownField(t *testing.T) {
+	if e := firstError(t, `{"action":"nope","params":{}}`); e.Code != CodeUnknownAction {
+		t.Errorf("code is %q, want %q", e.Code, CodeUnknownAction)
+	}
+	e := firstError(t, `{"action":"messages.list","params":{"account":"A","mailbox":"B","limt":5}}`)
+	if e.Code != CodeInvalidRequest || !strings.Contains(e.Message, "limt") {
+		t.Errorf("misspelled parameter should fail by name, got %+v", e)
+	}
+}
+
+func TestPatchRequiresSomethingToSet(t *testing.T) {
+	// The dryRun check comes after validation, so this never reaches Mail.app.
+	e := firstError(t, `{"action":"messages.patch","params":{"ids":["1"],"set":{}}}`)
+	if !strings.Contains(e.Message, "read and/or flagged") {
+		t.Errorf("empty set should be rejected, got %q", e.Message)
+	}
+}
+
 func TestExecuteBatchKeepsGoingAfterAFailure(t *testing.T) {
 	doc := `{"ops":[
-		{"action":"draft","to":["a@x.com"],"subject":"s","dryRun":true},
-		{"action":"nope"},
-		{"action":"draft","to":["b@x.com"],"subject":"s2","dryRun":true}
+		{"action":"draft","params":{"recipients":{"to":["a@x.com"]},"content":{"subject":"s"},"dryRun":true}},
+		{"action":"nope","params":{}},
+		{"action":"draft","params":{"recipients":{"to":["b@x.com"]},"content":{"subject":"s2"},"dryRun":true}}
 	]}`
 	resp, _ := run(t, doc)
 	if resp.OK {
@@ -125,40 +240,6 @@ func TestExecuteBatchKeepsGoingAfterAFailure(t *testing.T) {
 	}
 	if len(resp.Results) != 3 {
 		t.Fatalf("got %d results, want 3", len(resp.Results))
-	}
-}
-
-func TestUnknownParameterIsRejected(t *testing.T) {
-	resp, _ := run(t, `{"action":"messages.list","account":"A","mailbox":"B","limt":5}`)
-	if resp.OK {
-		t.Fatal("a misspelled parameter must fail rather than be ignored")
-	}
-	if got := resp.Results[0].Error.Code; got != CodeInvalidRequest {
-		t.Errorf("code is %q, want %q", got, CodeInvalidRequest)
-	}
-	if !strings.Contains(resp.Results[0].Error.Message, "limt") {
-		t.Errorf("message should name the offending field: %q", resp.Results[0].Error.Message)
-	}
-}
-
-func TestMissingRequiredParameterIsNamedInTheError(t *testing.T) {
-	resp, _ := run(t, `{"action":"messages.list","account":"A"}`)
-	if resp.OK {
-		t.Fatal("missing mailbox must fail")
-	}
-	msg := resp.Results[0].Error.Message
-	if !strings.Contains(msg, `"mailbox"`) {
-		t.Errorf("message should name the missing field: %q", msg)
-	}
-}
-
-func TestEnumParameterIsValidated(t *testing.T) {
-	resp, _ := run(t, `{"action":"messages.unified","box":"everything"}`)
-	if resp.OK {
-		t.Fatal("an out-of-enum box must fail")
-	}
-	if !strings.Contains(resp.Results[0].Error.Message, "inbox|unread") {
-		t.Errorf("message should list the allowed values: %q", resp.Results[0].Error.Message)
 	}
 }
 
@@ -218,7 +299,6 @@ func TestCompactProjectionShape(t *testing.T) {
 		t.Errorf("compact row has %d fields, want 8: %s", len(rows[0]), projected)
 	}
 
-	// The full projection must stay lossless.
 	full := projectMessages([]mail.Message{{ID: "1", Content: "body"}}, "full")
 	raw, err := json.Marshal(full)
 	if err != nil {
