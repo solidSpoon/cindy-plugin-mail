@@ -83,7 +83,7 @@ This matters because unknown parameters are **rejected, never ignored**, at any 
 | `attachments.list` | `message` | — |
 | `attachments.save` | `message`, `name` | `output` |
 
-`since` is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. `messages.search` matches subject and sender only — bodies are not searched. `messages.resolve` reports where ids live and changes nothing.
+`since` is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. `messages.search` matches subject and sender only, and never reads bodies — reading a body at all (`withContent`, `messages.show`) is the call that can block Mail.app, which is why a full-text search is not offered. `messages.resolve` reports where ids live and changes nothing.
 
 ## Write actions
 
@@ -165,7 +165,7 @@ JSON
 | Assuming English mailbox names | This machine is localized: `收件箱`, `草稿`, `垃圾邮件`, `已删除邮件`, `小道通讯`; Google stays English (`INBOX`, `Drafts`, `Spam`, `Trash`, `All Mail`, `Important`) |
 | Expecting fresh counts from cache | `accounts`/`mailboxes` cache 60s, message lists 5 min. Pass `noCache: true` when freshness matters |
 | `withContent` on a big or spam mailbox | It can block Mail.app's whole scripting interface until a body downloads |
-| Searching for body text | `messages.search` only looks at subject and sender — use `withContent` on a small mailbox instead |
+| Searching for body text | `messages.search` never reads bodies, which is why it is cheap; a full-text search is not available. Reading a body at all (`withContent`, `messages.show`) is the risky call |
 
 Accounts on this machine: `Exchange`, `iCloud`, `Google`.
 

@@ -165,7 +165,10 @@ the same structs the decoder uses, so it cannot drift from the implementation.
 
 `messages.unified` reads across all accounts in one call, and `since` accepts
 `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. `messages.search` matches subject and
-sender only — bodies are not searched, because doing so blocks Mail.app.
+sender only, and it never reads message bodies: reading a body
+(`withContent`, or `messages.show`) is the one call that can block Mail.app's
+entire scripting interface while a download stalls, so a full-text search is not
+offered. See [PERFORMANCE.md](PERFORMANCE.md).
 `messages.resolve` reports where ids currently live and changes nothing, which is
 what the `dryRun` paths use.
 

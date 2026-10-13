@@ -58,6 +58,31 @@ if `osascript -e "Application('Mail').accounts.length"` times out, sample Mail
 (`sample Mail 1`) — a stack containing `MCMessage(ScriptingSupport) content`
 means it must be restarted.
 
+### Measured 2026-10-13 (this machine, warm cache): not reproduced
+
+A scripted probe fetched `content()` from 7 messages on the Google (Gmail)
+account — the largest in `Spam`, `All Mail` and `INBOX`, including one of
+403 KB — with a per-call timeout and a liveness check after each one:
+
+| Observation | Result |
+|---|---|
+| Trivial call (`accounts.length`) | ~135 ms, stable |
+| First `content()` on a 403 KB message | 5.3 s, then 0.21 s for the same message via another mailbox |
+| Gmail `Spam` newsletter (45 KB) | 1.77 s, 1,704 characters of body |
+| Mail.app responsive after each fetch | yes, ~135–170 ms |
+| Hangs | none in 7 fetches |
+
+So the stall above is **not** a general property of `content()`: it needs the
+cold-cache + remote-content case the paragraph describes (immediately after a
+Mail.app start, body not downloaded, remote content to resolve). Treat the
+mitigations as applying to that case. Reproducing it deliberately means quitting
+and relaunching Mail.app first.
+
+Also worth stating explicitly: `messages.search` never reads bodies. The search
+implementation lowercases `subject()` and `sender()` and matches on those, so
+"full-text search would hang" is an inference about reading every body in turn —
+not something search does today.
+
 ## Moves change message IDs
 
 When a message is moved (archive, move, quarantine) Mail assigns it a new ID in the
