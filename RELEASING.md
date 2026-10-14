@@ -106,6 +106,15 @@ verified here.
   packaging (CI does this for you).
 - The bundled binary needs its executable bit set before packaging. `make plugin`
   and `make plugin-universal` do it, and `make verify` fails loudly if it is lost.
+- `make verify` also **executes** the bundled binary (`--version`). That gate exists
+  because CI once built a darwin/arm64 binary that dyld refused to load
+  (`missing LC_UUID load command`) and nothing caught it: the other checks only
+  inspect the file, they never run it. Never ship a binary that has not been run.
+- The workflows pin `go-version` explicitly instead of using
+  `go-version-file: go.mod`. The `go` directive in `go.mod` is the **minimum** Go
+  the module supports; it is not the toolchain to build release artifacts with.
+  Go 1.21 emits darwin/arm64 binaries without LC_UUID, which current macOS
+  runners abort at load. Keep the pinned version at 1.22 or newer.
 - `make skill` syncs `skills/mail-app-cli/` to `~/.agents/skills/mail-app-cli/`.
   `skills/mail-app-cli/SKILL.md` and `ghost/manual/operations/MANUAL.md` cover
   overlapping ground for two different audiences (any agent vs Cindy agents);

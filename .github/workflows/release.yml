@@ -33,7 +33,10 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Not go-version-file: go.mod - that declares the minimum Go the module
+          # supports, not what we ship. Go 1.21 produces darwin/arm64 binaries
+          # that current macOS runners refuse to load (missing LC_UUID).
+          go-version: '1.23'
           cache: true
 
       - name: Test

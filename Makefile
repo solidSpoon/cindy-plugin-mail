@@ -47,6 +47,9 @@ verify:
 	test "$$got" = "$$want" \
 		|| { echo "  FAIL  $(GHOST_BIN) was built from '$$got', not HEAD ($$(git rev-parse --short HEAD)) - run 'make plugin-universal'"; exit 1; }
 	@echo "  OK    $(GHOST_BIN) is built from HEAD"
+	@$(GHOST_BIN) --version >/dev/null 2>&1 \
+		|| { echo "  FAIL  $(GHOST_BIN) does not run on this machine (loader, code signature, arch or permission problem) - CI once shipped a darwin/arm64 binary that dyld refused to load"; exit 1; }
+	@echo "  OK    $(GHOST_BIN) runs"
 	@if [ -f "$(HOME)/.local/bin/$(BIN)" ]; then \
 		if cmp -s $(GHOST_BIN) "$(HOME)/.local/bin/$(BIN)"; then \
 			echo "  OK    ~/.local/bin/$(BIN) is byte-identical to the bundle"; \
