@@ -77,7 +77,7 @@ This matters because unknown parameters are **rejected, never ignored**, at any 
 | `mailboxes.list` | — | `account`, `counts`, `unreadOnly`, `noCache` |
 | `messages.list` | `account`, `mailbox` | `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
 | `messages.unified` | `box` | `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
-| `messages.show` | `message` | `body` (`text\|html\|both`) |
+| `messages.show` | `message` | `body` (`text\|html\|links`) |
 | `messages.search` | `query` | `account`, `mailbox`, `limit`, `format` |
 | `messages.resolve` | `ids` | — |
 | `attachments.list` | `message` | — |
@@ -125,7 +125,7 @@ mail-app-cli '{"action":"messages.show","params":{"message":{"id":"7847","in":{"
 #  to anchor text, so `body` is what recovers them)
 mail-app-cli '{"action":"messages.show","params":{
   "message":{"id":"7811","in":{"account":"Google","mailbox":"Spam"}},
-  "body":"both"}}' \
+  "body":"links"}}' \
   | jq -r '.results[0].data | (.links[] | "\(.text) -> \(.href)"), (.listUnsubscribe[]? | "unsubscribe: \(.)")'
 
 # propose, then apply (quarantine is the safe "get it out of the inbox")
@@ -174,7 +174,7 @@ JSON
 | Expecting fresh counts from cache | `accounts`/`mailboxes` cache 60s, message lists 5 min. Pass `noCache: true` when freshness matters |
 | `withContent` on a big or spam mailbox | It can block Mail.app's whole scripting interface until a body downloads |
 | Searching for body text | `messages.search` never reads bodies, which is why it is cheap; a full-text search is not available. Reading a body at all (`withContent`, `messages.show`) is the risky call |
-| Reporting "there is no unsubscribe link" | The default body is Mail.app's *rendered* text, where every URL has been flattened to anchor text. Use `body: "html"` or `"both"` to get `links` (real hrefs) and `listUnsubscribe` (RFC 2369/8058, the sender's own route — often present when the body has no anchor at all) |
+| Reporting "there is no unsubscribe link" | The default body is Mail.app's *rendered* text, where every URL has been flattened to anchor text. Use `body: "html"` or `"links"` to get `links` (real hrefs) and `listUnsubscribe` (RFC 2369/8058, the sender's own route — often present when the body has no anchor at all) |
 
 Accounts on this machine: `Exchange`, `iCloud`, `Google`.
 

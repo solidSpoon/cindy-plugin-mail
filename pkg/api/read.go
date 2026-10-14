@@ -245,16 +245,16 @@ func init() {
 
 type MessagesShowParams struct {
 	Message MessageInMailbox `json:"message" req:"1"`
-	Body    string           `json:"body,omitempty" enum:"text|html|both" def:"text" desc:"text: Mail.app's rendered body, in which hyperlinks are already flattened to their anchor text. html: parse the raw message source and return html, links and listUnsubscribe. both: that, plus the plain-text part parsed from the source."`
+	Body    string           `json:"body,omitempty" enum:"text|html|links" def:"text" desc:"text: Mail.app's rendered body, in which hyperlinks are already flattened to their anchor text. html: parse the raw message source and return its html, links and listUnsubscribe. links: the same parse without the html field, when all you need are the addresses."`
 }
 
 func init() {
-	Register("messages.show", "Show one message in full, including its body and thread headers. body:\"html\" recovers the hyperlinks and List-Unsubscribe route that the rendered text loses", func(req MessagesShowParams) (any, error) {
+	Register("messages.show", "Show one message in full, including its body and thread headers. body:\"html\" or \"links\" recovers the hyperlinks and the List-Unsubscribe route that the rendered text loses", func(req MessagesShowParams) (any, error) {
 		client := mail.NewClient()
 		in := req.Message.In
 		// Asking for the source replaces the rendered-body read rather than
 		// adding to it, so either way the message is read once.
-		wantSource := req.Body == "html" || req.Body == "both"
+		wantSource := req.Body == "html" || req.Body == "links"
 
 		message, err := client.GetMessageDetailsJSON(in.Account, in.Mailbox, req.Message.ID, !wantSource)
 		if err != nil {
@@ -280,10 +280,14 @@ func init() {
 			return nil, errf(CodeScriptFailed, "could not parse the raw source of %s: %v", req.Message.ID, perr).
 				withHint(`the rendered body is still available with "body":"text"`)
 		}
+		// The text part comes out of the same parse, so it is always included;
+		// the html is what "links" leaves out, since it is the bulky half.
 		if parsed.Text != "" {
 			message.Content = parsed.Text
 		}
-		data["html"] = parsed.HTML
+		if req.Body != "links" {
+			data["html"] = parsed.HTML
+		}
 		data["links"] = parsed.Links
 		data["listUnsubscribe"] = parsed.ListUnsubscribe
 		data["listUnsubscribeOneClick"] = parsed.ListUnsubscribeOneClick

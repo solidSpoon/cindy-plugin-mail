@@ -157,7 +157,7 @@ the same structs the decoder uses, so it cannot drift from the implementation.
 | `mailboxes.list` | `account`, `counts`, `unreadOnly`, `noCache` |
 | `messages.list` | `account`, `mailbox`, `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
 | `messages.unified` | `box` (`inbox\|unread\|flagged\|sent\|drafts\|trash\|junk`), `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
-| `messages.show` | `message` (`MessageInMailbox`) | `body` (`text\|html\|both`) |
+| `messages.show` | `message` (`MessageInMailbox`) | `body` (`text\|html\|links`) |
 | `messages.search` | `query`, `account`, `mailbox`, `limit`, `format` |
 | `messages.resolve` | `ids` |
 | `attachments.list` | `message` |
@@ -239,14 +239,14 @@ URLs are all still there:
 ```bash
 mail-app-cli '{"action":"messages.show","params":{
   "message":{"id":"7811","in":{"account":"Google","mailbox":"Spam"}},
-  "body":"both"}}'
+  "body":"links"}}'
 ```
 
 | `body` | Returns |
 |--------|---------|
 | `text` (default) | Mail.app's rendered text in `message.Content` |
-| `html` | `html` (the decoded `text/html` part), `links` (`[{text, href}]`), `listUnsubscribe`, `listUnsubscribeOneClick` |
-| `both` | All of the above, with `message.Content` filled from the source's `text/plain` part |
+| `links` | `links` (`[{text, href}]`), `listUnsubscribe`, `listUnsubscribeOneClick`, and `message.Content` from the source's `text/plain` part. The smallest way to get the addresses |
+| `html` | The same, plus `html` (the decoded `text/html` part) |
 
 `listUnsubscribe` comes from the `List-Unsubscribe` header (RFC 2369): the
 sender's own machine-readable unsubscribe route, which mail with no anchor in
@@ -254,7 +254,7 @@ the body at all often still carries. `listUnsubscribeOneClick` reports RFC
 8058's `List-Unsubscribe-Post`, meaning the https entry accepts a bare POST with
 no confirmation page.
 
-The message is still read only once — asking for `html`/`both` replaces the
+The message is still read only once — asking for `html`/`links` replaces the
 rendered-body read rather than adding to it. The trade-offs are size (the source
 is the whole message, attachments included) and that it remains a body read, so
 the caveat above applies to it too.
