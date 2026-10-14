@@ -177,6 +177,28 @@ function ensureMailbox(acc, name) {
 }
 `
 
+// jsArchiveBox resolves an account's archive mailbox by any of the names it
+// goes by. Generated from archiveCandidates so the scripting layer and
+// ArchiveMailboxName cannot disagree.
+var jsArchiveBox = `
+function archiveBox(acc) {
+	const candidates = ` + jsStringArray(archiveCandidates) + `;
+	for (const name of candidates) {
+		try { const box = resolveMailbox(acc, name); if (box) return box; } catch (e) {}
+	}
+	return null;
+}
+`
+
+// jsStringArray renders a Go slice as a JavaScript array literal.
+func jsStringArray(values []string) string {
+	parts := make([]string, 0, len(values))
+	for _, v := range values {
+		parts = append(parts, "'"+escapeJSString(v)+"'")
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
 // jsParseThreadHeaders extracts In-Reply-To and References from a raw
 // "all headers" string. Both headers can fold across lines (RFC 5322
 // continuation lines start with whitespace), so each is matched up to the
@@ -195,9 +217,10 @@ function parseThreadHeaders(headers) {
 }
 `
 
-// DefaultQuarantineMailbox is the holding mailbox used by `messages
-// quarantine`. Messages are *moved* here, never deleted, so the operation stays
-// reversible from Mail.app.
+// DefaultQuarantineMailbox is the holding mailbox `messages quarantine` uses
+// when the caller names none. It has to be created once in Mail.app: a mailbox
+// created by scripting is local-only and never receives anything (see
+// QuarantineMessages).
 //
 // A dedicated mailbox is used instead of the account's Trash because Mail.app
 // permanently empties Trash on its own schedule (see the account properties
@@ -1258,6 +1281,76 @@ func (c *Client) GetMessagesFromMultipleMailboxes(requests []struct {
 //
 // "unread" and "flagged" are treated as inbox views with the appropriate
 // filter applied.
+// MailboxMessageIDs returns the RFC 5322 Message-ID of every message in one
+// mailbox, in a single bulk read. It is how a move gets confirmed: Mail.app
+// assigns a new id on a move, so the message can only be found again by the
+// Message-ID it carried in.
+func (c *Client) MailboxMessageIDs(accountName, mailboxName string) ([]string, error) {
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+const out = { error: '', ids: [] };
+try {
+	const acc = mail.accounts.byName('%s');
+	const mbox = resolveMailbox(acc, '%s');
+	if (!mbox) throw 'Mailbox not found';
+	out.ids = mbox.messages.messageId();
+} catch (e) {
+	out.error = String(e);
+}
+JSON.stringify(out);
+`, escapeJSString(accountName), escapeJSString(mailboxName))
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Error string   `json:"error"`
+		IDs   []string `json:"ids"`
+	}
+	if err := json.Unmarshal([]byte(output), &raw); err != nil {
+		return nil, fmt.Errorf("unexpected output: %s", output)
+	}
+	if raw.Error != "" {
+		return nil, fmt.Errorf("%s", raw.Error)
+	}
+	return raw.IDs, nil
+}
+
+// archiveCandidates are the names an account's archive mailbox goes by. Mail.app
+// exposes no unified archive accessor (unlike inbox/sent/drafts/trash/junk) and
+// the name is localized, so it has to be looked for by name. "All Mail" is
+// deliberately absent: on Gmail it is every message, not an archive.
+var archiveCandidates = []string{"Archive", "存档", "归档", "Archives", "已归档", "封存"}
+
+// ArchiveMailboxName resolves the name of an account's archive mailbox, or ""
+// when the account has none under any known name.
+func (c *Client) ArchiveMailboxName(accountName string) (string, error) {
+	candidates, _ := json.Marshal(archiveCandidates)
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+const candidates = %s;
+const acc = mail.accounts.byName('%s');
+let found = '';
+for (const name of candidates) {
+	try { if (resolveMailbox(acc, name)) { found = name; break; } } catch (e) {}
+}
+JSON.stringify(found);
+`, string(candidates), escapeJSString(accountName))
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return "", err
+	}
+	var name string
+	if err := json.Unmarshal([]byte(output), &name); err != nil {
+		return "", fmt.Errorf("unexpected output: %s", output)
+	}
+	return name, nil
+}
+
 // GetUnifiedMessagesJSON retrieves messages from unified views across all accounts.
 //
 // mailboxType must be one of: "inbox", "unread", "flagged", "sent", "drafts",
@@ -1289,6 +1382,9 @@ type MessageLocation struct {
 	Exists  bool   `json:"exists"`
 	Account string `json:"account,omitempty"`
 	Mailbox string `json:"mailbox,omitempty"`
+	// MessageID is the RFC 5322 Message-ID. It survives a move while Mail.app's
+	// own id does not, so it is what a moved message can be looked for by.
+	MessageID string `json:"messageId,omitempty"`
 }
 
 // ResolveMessages reports, for each id, whether it exists and which mailbox it
@@ -1308,9 +1404,11 @@ const container = mail.inbox().messages;
 for (const id of wanted) {
 	const r = { id: String(id), exists: false };
 	try {
-		const mbox = container.byId(Number(id)).mailbox();
+		const m = container.byId(Number(id));
+		const mbox = m.mailbox();
 		r.account = mbox.account().name();
 		r.mailbox = mbox.name();
+		r.messageId = m.messageId() || '';
 		r.exists = true;
 	} catch (e) {}
 	out.push(r);
@@ -1623,32 +1721,25 @@ func (c *Client) MoveMessages(accountName, sourceMailbox string, messageIDs []st
 func (c *Client) ArchiveMessages(accountName, mailboxName string, messageIDs []string) (*MutationResult, error) {
 	prelude := `if (resolveMailbox(acc, 'All Mail')) throw 'Gmail accounts cannot be archived safely via Mail.app scripting. ' +
 		'Archive it in Mail.app or Gmail directly, or use "messages quarantine" to park it in a holding mailbox.';
-	const destMbox = resolveMailbox(acc, 'Archive');
+	const destMbox = archiveBox(acc);
 	if (!destMbox) throw 'Archive mailbox not found';`
-	return c.mutateMessages(accountName, mailboxName, messageIDs, prelude, "mail.move(msg, { to: destMbox });")
+	return c.mutateMessages(accountName, mailboxName, messageIDs, jsArchiveBox+prelude, "mail.move(msg, { to: destMbox });")
 }
 
 // QuarantineMessages moves several messages into a holding mailbox instead of
-// deleting them, creating that mailbox inside each message's own account when
-// it does not exist yet. Nothing is destroyed and the move is reversible from
-// Mail.app, so this is the safe replacement for `messages delete`.
+// deleting them. Nothing is destroyed and the move is reversible from Mail.app,
+// so this is the safe replacement for `messages delete`.
 //
-// Creation and the move run in separate osascript processes: a mailbox created
-// inside the same script that moves messages into it hands back an unusable
-// specifier ("Can't get object"), because Mail.app has not refreshed its
-// mailbox list yet.
+// The holding mailbox must already exist in the account. It is deliberately not
+// created here: a mailbox created through Mail.app's scripting interface lives
+// only in the local store, the server has never heard of it, and anything moved
+// into it is re-delivered to its original mailbox under a new id. Measured on
+// an Exchange account, a scripted mailbox never received a single message.
+// Create the mailbox in Mail.app itself - that registers it on the server - and
+// quarantine into it afterwards.
 func (c *Client) QuarantineMessages(mailboxName string, messageIDs []string) (*GlobalSummary, error) {
 	if mailboxName == "" {
 		mailboxName = DefaultQuarantineMailbox
-	}
-	accounts, err := c.HoldingMailboxAccounts(messageIDs)
-	if err != nil {
-		return nil, err
-	}
-	for _, account := range accounts {
-		if _, err := c.EnsureHoldingMailbox(account, mailboxName); err != nil {
-			return nil, err
-		}
 	}
 	return c.MutateMessagesGlobal(messageIDs, "quarantine", mailboxName, "")
 }
@@ -1659,80 +1750,10 @@ func (c *Client) QuarantineMessagesIn(accountName, mailboxName, boxName string, 
 	if boxName == "" {
 		boxName = DefaultQuarantineMailbox
 	}
-	if _, err := c.EnsureHoldingMailbox(accountName, boxName); err != nil {
-		return nil, err
-	}
 	box := escapeJSString(boxName)
 	prelude := fmt.Sprintf(`const destMbox = resolveMailbox(acc, '%s');
 	if (!destMbox) throw 'Holding mailbox "%s" is missing in ' + acc.name();`, box, box)
 	return c.mutateMessages(accountName, mailboxName, messageIDs, prelude, "mail.move(msg, { to: destMbox });")
-}
-
-// HoldingMailboxAccounts returns the distinct account names that own the given
-// Mail.app message ids, so a holding mailbox can be created only where it is
-// actually needed. Ids that cannot be resolved are ignored.
-func (c *Client) HoldingMailboxAccounts(messageIDs []string) ([]string, error) {
-	if len(messageIDs) == 0 {
-		return nil, nil
-	}
-	idsJSON, _ := json.Marshal(messageIDs)
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-const wanted = %s;
-const seen = {};
-const accounts = [];
-const container = mail.inbox().messages;
-for (const id of wanted) {
-	try {
-		const name = container.byId(Number(id)).mailbox().account().name();
-		if (!seen[name]) { seen[name] = true; accounts.push(name); }
-	} catch (e) {}
-}
-JSON.stringify(accounts);
-`, string(idsJSON))
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return nil, err
-	}
-	var accounts []string
-	if err := json.Unmarshal([]byte(output), &accounts); err != nil {
-		return nil, fmt.Errorf("unexpected output: %s", output)
-	}
-	return accounts, nil
-}
-
-// EnsureHoldingMailbox creates boxName inside accountName when it does not
-// exist yet and reports whether it created it. It runs in its own osascript
-// process on purpose: see QuarantineMessages.
-func (c *Client) EnsureHoldingMailbox(accountName, boxName string) (bool, error) {
-	if boxName == "" {
-		boxName = DefaultQuarantineMailbox
-	}
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-`+jsResolveMailbox+`
-const acc = mail.accounts.byName('%s');
-const name = '%s';
-if (resolveMailbox(acc, name)) {
-	JSON.stringify({ created: false });
-} else {
-	ensureMailbox(acc, name);
-	JSON.stringify({ created: true });
-}
-`, escapeJSString(accountName), escapeJSString(boxName))
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return false, err
-	}
-	var res struct {
-		Created bool `json:"created"`
-	}
-	if err := json.Unmarshal([]byte(output), &res); err != nil {
-		return false, fmt.Errorf("unexpected output: %s", output)
-	}
-	return res.Created, nil
 }
 
 // MailboxMarkResult reports one mailbox touched by a mark-read operation.
@@ -1865,6 +1886,10 @@ JSON.stringify(results);
 }
 
 // GlobalResult is the per-message outcome of a global (no account/mailbox)
+
+// GlobalSummary aggregates GlobalResults.
+
+// GlobalResult is the per-message outcome of a global (no account/mailbox)
 // mutation. Status is one of ok, missing, failed, skipped.
 type GlobalResult struct {
 	ID      string `json:"id"`
@@ -1908,10 +1933,10 @@ func (s *GlobalSummary) Err() error {
 // own mailbox().account() supplies the context. Messages from any mix of
 // accounts can be handled in one round trip.
 //
-// action: "read", "unread", "flag", "unflag", "quarantine" (target is the
-// holding mailbox name, created inside each message's own account when
-// missing), "move" (target is the destination mailbox name within each
-// message's own account) or "archive". For archive, gmailPolicy decides what
+// action: "read", "unread", "flag", "unflag", "quarantine" (target is a holding
+// mailbox that must already exist inside each message's own account), "move"
+// (target is the destination mailbox name within each message's own account) or
+// "archive". For archive, gmailPolicy decides what
 // happens to messages in Gmail accounts (which cannot be archived safely via
 // scripting, see ArchiveMessages): "skip" (default) or "read" (just mark read).
 //
@@ -1923,7 +1948,7 @@ func (c *Client) MutateMessagesGlobal(messageIDs []string, action, target, gmail
 	}
 	script := fmt.Sprintf(`
 const mail = Application('Mail');
-`+jsResolveMailbox+`
+`+jsResolveMailbox+jsArchiveBox+`
 const wanted = %s;
 const action = '%s';
 const target = '%s';
@@ -1972,7 +1997,7 @@ for (const id of wanted) {
 				else { r.status = 'skipped'; r.error = 'Gmail accounts cannot be archived via Mail.app scripting'; }
 				break;
 			}
-			if (archiveBoxes[accName] === undefined) archiveBoxes[accName] = resolveMailbox(acc, 'Archive');
+			if (archiveBoxes[accName] === undefined) archiveBoxes[accName] = archiveBox(acc);
 			if (!archiveBoxes[accName]) throw 'Archive mailbox not found in ' + accName;
 			mail.move(msg, { to: archiveBoxes[accName] });
 			break;

@@ -22,8 +22,10 @@ discouraged. Both are reported by the `schema` action at runtime.
 - **It cannot send mail.** `draft` composes a message into Mail.app's Drafts
   mailbox and stops there; you review it and press Send in Mail.app.
 - **It cannot delete mail.** There is no delete action. `messages.quarantine`
-  moves messages into a holding mailbox (default `待删除`, created per account on
-  demand), which stays visible and reversible from Mail.app.
+  moves messages into a holding mailbox you created once in Mail.app (default
+  `待删除`), which stays visible and reversible from Mail.app. The mailbox has
+  to exist on the server: one created by scripting is local-only, see "Moves
+  are verified" below.
 
 Every mutation also accepts `"dryRun": true`, which reports exactly what it
 would touch and changes nothing.
@@ -102,6 +104,7 @@ instead of parsing prose:
 | `PARTIAL_FAILURE` | The action ran, but not every id was handled — `data` lists which |
 | `HOLDING_BOX_UNAVAILABLE` | The quarantine mailbox is missing and could not be created |
 | `GMAIL_ARCHIVE_UNSUPPORTED` | Mail.app cannot archive Gmail; use `messages.quarantine` |
+| `MOVE_NOT_PERSISTED` | A move was reported as done but the destination never received the messages; see "Moves are verified" |
 | `DRAFT_UNVERIFIED` | The draft was composed but not seen in Drafts; look in Mail.app |
 | `MAIL_SCRIPT_ERROR`, `INTERNAL` | Mail.app or the tool failed |
 
@@ -228,6 +231,36 @@ mail-app-cli '{"action":"messages.show",
                "params":{"message":{"id":"7847",
                                     "in":{"account":"Google","mailbox":"All Mail"}}}}'
 ```
+
+### Moves are verified, because Mail.app lies about them
+
+A scripted move reports success without doing anything when the destination is a
+mailbox **created through scripting**: it exists only in Mail.app's local store,
+the server has never heard of it, and the message is re-delivered to its original
+mailbox under a new id. Measured here: a scripted mailbox never received a single
+message, while the same move into the pre-existing `存档` mailbox stuck.
+
+So `messages.move`, `messages.archive` and `messages.quarantine` read the
+destination back and report what they found. Mail.app assigns new ids on a move,
+so the check is by the RFC 5322 `Message-ID`, captured before moving:
+
+| Field | Meaning |
+|-------|---------|
+| `confirmed` | how many of the handled messages are in the destination |
+| `verified` | their ids |
+| `notPersisted` | ids the move claimed but the destination never received |
+| `unverifiable` | ids with no readable `Message-ID`; no claim is made about them |
+
+Any `notPersisted` fails the operation with `MOVE_NOT_PERSISTED` and a hint.
+Nothing is rolled back: the messages are where they were.
+
+Two consequences worth knowing:
+
+- **Create the destination in Mail.app, not through this tool.** A mailbox made
+  in Mail.app is registered on the server and receives mail normally.
+- `messages.archive` looks for the account's archive mailbox by name
+  (`Archive`, `存档`, `归档`, ...) because Mail.app exposes no unified archive
+  accessor and the name is localized.
 
 ### Getting real hyperlinks out of a message
 

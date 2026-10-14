@@ -34,8 +34,12 @@ const (
 	// CodePartialFailure means the action ran but not every id was handled. The
 	// data field still carries the per-id outcome.
 	CodePartialFailure = "PARTIAL_FAILURE"
-	CodeScriptFailed   = "MAIL_SCRIPT_ERROR"
-	CodeInternal       = "INTERNAL"
+	// CodeMoveNotPersisted means a relocation was reported as done but reading
+	// the destination back found the messages were not there: the server had
+	// re-delivered them. See confirmMoved.
+	CodeMoveNotPersisted = "MOVE_NOT_PERSISTED"
+	CodeScriptFailed     = "MAIL_SCRIPT_ERROR"
+	CodeInternal         = "INTERNAL"
 )
 
 // Error is a structured failure. Code is meant to be matched on; Message is

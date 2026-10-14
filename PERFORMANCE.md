@@ -100,6 +100,37 @@ so the warning above applies to it. The MIME parsing happens in Go
 (`pkg/rawmail`), not in the scripting layer, which is what makes
 `messages.show` with `body:"html"` cheap enough to offer at all.
 
+## A mailbox created by scripting never receives mail (2026-10-14)
+
+Moving messages into a mailbox that this tool created appeared to succeed and
+changed nothing. Measured on the Exchange account, one message at a time:
+
+| Destination | Result |
+|---|---|
+| `待删除`, created by scripting | reported `ok`, message never entered it, re-delivered to `收件箱` under a new id (8369 -> 8371 -> 8373 across attempts) |
+| `存档`, pre-existing on the server | moved, and still there after a sync 60s later |
+
+The id changing on every attempt is the signature: the server still has the
+message in its original mailbox, so Mail.app re-inserts it and drops the local
+copy. A scripted mailbox lives in Mail.app's local store only; the server has
+never heard of it, so there is nothing to move the message into.
+
+Consequences baked into the tool:
+
+- `messages.quarantine` does not create the holding mailbox any more (it used to,
+  which is how two empty local mailboxes ended up in the account). It fails with
+  `HOLDING_BOX_UNAVAILABLE`, and the mailbox has to be created in Mail.app.
+- `messages.move`, `messages.archive` and `messages.quarantine` read the
+  destination back and report `confirmed` / `notPersisted`, tracked by RFC
+  `Message-ID` because Mail.app assigns new ids on a move. Before this, 250
+  messages were reported as changed while every one of them bounced back.
+- `messages.archive` resolves the archive mailbox by name per account
+  (`Archive`, `存档`, ...); it used to hard-code `Archive`, which never matches on
+  a localized account.
+
+A failed move is reported immediately: the message never appears in the
+destination, so no sync round-trip is needed to detect it.
+
 ## Moves change message IDs
 
 When a message is moved (archive, move, quarantine) Mail assigns it a new ID in the

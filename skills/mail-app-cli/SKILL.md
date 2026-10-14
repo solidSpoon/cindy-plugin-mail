@@ -36,7 +36,7 @@ The tool is built so the irreversible things are impossible, not discouraged:
 | It cannot | Do this instead |
 |-----------|-----------------|
 | **send mail** | `draft` — composes into Mail.app's Drafts mailbox; the user reviews and presses Send |
-| **delete mail** | `messages.quarantine` — moves into a holding mailbox (default `待删除`), reversible from Mail.app |
+| **delete mail** | `messages.quarantine` — moves into a holding mailbox (default `待删除`) that **the user created in Mail.app**, reversible from Mail.app |
 
 Never claim mail was sent or deleted. If the user asks to delete something, quarantine it and say that is what happened.
 
@@ -58,7 +58,7 @@ This matters because unknown parameters are **rejected, never ignored**, at any 
 
 - Envelope: `{"ok", "okCount", "failed", "results":[...]}`; each result has `ok`, `dryRun`, `data`, `error{code,hint}`.
 - **Exit code** is `0` when every operation succeeded, `1` otherwise — the JSON is printed either way.
-- Branch on `error.code`, not on prose: `MESSAGE_MISSING`, `MAILBOX_NOT_FOUND`, `ACCOUNT_NOT_FOUND`, `PARTIAL_FAILURE` (data still lists what worked), `HOLDING_BOX_UNAVAILABLE`, `GMAIL_ARCHIVE_UNSUPPORTED`, `DRAFT_UNVERIFIED`, `INVALID_REQUEST`, `UNKNOWN_ACTION`.
+- Branch on `error.code`, not on prose: `MESSAGE_MISSING`, `MAILBOX_NOT_FOUND`, `ACCOUNT_NOT_FOUND`, `PARTIAL_FAILURE` (data still lists what worked), `HOLDING_BOX_UNAVAILABLE`, `MOVE_NOT_PERSISTED`, `GMAIL_ARCHIVE_UNSUPPORTED`, `DRAFT_UNVERIFIED`, `INVALID_REQUEST`, `UNKNOWN_ACTION`.
 - Add `"pretty": true` (next to `"action"`) only when a human will read it; the default single line is about half the bytes.
 - `"format": "compact"` on reads returns 8 fields per message instead of 16 — use it for anything you will scan.
 
@@ -170,6 +170,8 @@ JSON
 | Expecting `draft` to send | It cannot. It reports `verified`, or `syncing` when Mail.app has not stored it yet; not found → `DRAFT_UNVERIFIED` |
 | Trying to move a draft out of Drafts | Mail.app puts it straight back under a new id. Only the user can remove drafts, in Mail.app |
 | Using Trash as a holding area | Mail.app empties each account's Trash on its own schedule. Quarantine instead |
+| Creating the holding mailbox with this tool | A scripted mailbox is **local-only**: the server re-delivers anything moved into it under a new id, and the tool no longer creates mailboxes at all. Ask the user to create it in Mail.app (that registers it server-side), then quarantine into it |
+| Trusting `changed: N` from a move | It is not evidence. `messages.move/archive/quarantine` read the destination back and report `confirmed` / `notPersisted`; a non-empty `notPersisted` means `MOVE_NOT_PERSISTED` and nothing moved. The check is by RFC `Message-ID`, because ids change on every move |
 | Assuming English mailbox names | This machine is localized: `收件箱`, `草稿`, `垃圾邮件`, `已删除邮件`, `小道通讯`; Google stays English (`INBOX`, `Drafts`, `Spam`, `Trash`, `All Mail`, `Important`) |
 | Expecting fresh counts from cache | `accounts`/`mailboxes` cache 60s, message lists 5 min. Pass `noCache: true` when freshness matters |
 | `withContent` on a big or spam mailbox | It can block Mail.app's whole scripting interface until a body downloads |

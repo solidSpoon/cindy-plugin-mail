@@ -206,13 +206,21 @@ type MessagesMoveParams struct {
 }
 
 func init() {
-	Register("messages.move", "Move messages to another mailbox. The moved messages get new ids in the destination", func(req MessagesMoveParams) (any, error) {
+	Register("messages.move", "Move messages to another mailbox. The moved messages get new ids in the destination, and the destination is read back to confirm they arrived", func(req MessagesMoveParams) (any, error) {
 		if req.DryRun {
 			return dryRunLocations(req.IDs)
 		}
 		ref := splitRef(req.In)
 		client := mail.NewClient()
+		before, err := client.ResolveMessages(req.IDs)
+		if err != nil {
+			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
+		}
 		verb := "moved to " + req.To
+		var (
+			data    any
+			handled []string
+		)
 		if ref != nil {
 			res, err := client.MoveMessages(ref.account, ref.mailbox, req.IDs, req.To)
 			if err != nil {
@@ -220,13 +228,19 @@ func init() {
 			}
 			invalidateMailboxCache(ref.account, ref.mailbox)
 			invalidateMailboxCache(ref.account, req.To)
-			return mutationData(res, verb)
+			data, _ = mutationData(res, verb)
+			handled = res.Succeeded
+		} else {
+			sum, err := client.MutateMessagesGlobal(req.IDs, "move", req.To, "")
+			if err != nil {
+				return nil, errf(CodeScriptFailed, "move failed: %v", err)
+			}
+			data, _ = globalData(sum, verb)
+			handled = succeededIDs(sum)
 		}
-		sum, err := client.MutateMessagesGlobal(req.IDs, "move", req.To, "")
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "move failed: %v", err)
-		}
-		return globalData(sum, verb)
+		report := confirmMoved(client, before, handled, fixedDest(req.To))
+		attachReport(data, report)
+		return data, relocationError(report, req.To)
 	})
 }
 
@@ -240,26 +254,43 @@ type MessagesArchiveParams struct {
 }
 
 func init() {
-	Register("messages.archive", "Move messages to the account's Archive mailbox", func(req MessagesArchiveParams) (any, error) {
+	Register("messages.archive", "Move messages to the account's Archive mailbox (whose name is localized), confirming that they arrived", func(req MessagesArchiveParams) (any, error) {
 		if req.DryRun {
 			return dryRunLocations(req.IDs)
 		}
 		ref := splitRef(req.In)
 		client := mail.NewClient()
+		before, err := client.ResolveMessages(req.IDs)
+		if err != nil {
+			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
+		}
+		dest := archiveDest(client)
+		var (
+			data    any
+			handled []string
+		)
 		if ref != nil {
 			res, err := client.ArchiveMessages(ref.account, ref.mailbox, req.IDs)
 			if err != nil {
 				return nil, archiveError(err)
 			}
 			invalidateMailboxCache(ref.account, ref.mailbox)
-			invalidateMailboxCache(ref.account, "Archive")
-			return mutationData(res, "archived")
+			if name, derr := dest(ref.account); derr == nil {
+				invalidateMailboxCache(ref.account, name)
+			}
+			data, _ = mutationData(res, "archived")
+			handled = res.Succeeded
+		} else {
+			sum, err := client.MutateMessagesGlobal(req.IDs, "archive", "", req.GmailPolicy)
+			if err != nil {
+				return nil, archiveError(err)
+			}
+			data, _ = globalData(sum, "archived")
+			handled = succeededIDs(sum)
 		}
-		sum, err := client.MutateMessagesGlobal(req.IDs, "archive", "", req.GmailPolicy)
-		if err != nil {
-			return nil, archiveError(err)
-		}
-		return globalData(sum, "archived")
+		report := confirmMoved(client, before, handled, dest)
+		attachReport(data, report)
+		return data, relocationError(report, "Archive")
 	})
 }
 
@@ -273,7 +304,7 @@ type MessagesQuarantineParams struct {
 }
 
 func init() {
-	Register("messages.quarantine", "Park messages in a holding mailbox. This is the safe replacement for deleting: nothing is destroyed and the move is reversible from Mail.app", func(req MessagesQuarantineParams) (any, error) {
+	Register("messages.quarantine", "Park messages in a holding mailbox that already exists on the server. This is the safe replacement for deleting: nothing is destroyed, the move is reversible, and the destination is read back to confirm it arrived", func(req MessagesQuarantineParams) (any, error) {
 		if req.DryRun {
 			return dryRunLocations(req.IDs)
 		}
@@ -283,6 +314,14 @@ func init() {
 			box = mail.DefaultQuarantineMailbox
 		}
 		client := mail.NewClient()
+		before, err := client.ResolveMessages(req.IDs)
+		if err != nil {
+			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
+		}
+		var (
+			data    any
+			handled []string
+		)
 		if ref != nil {
 			res, err := client.QuarantineMessagesIn(ref.account, ref.mailbox, box, req.IDs)
 			if err != nil {
@@ -291,14 +330,20 @@ func init() {
 			invalidateMailboxCache(ref.account, ref.mailbox)
 			invalidateMailboxCache(ref.account, box)
 			invalidateMailboxListCache()
-			return mutationData(res, "quarantined in "+box)
+			data, _ = mutationData(res, "quarantined in "+box)
+			handled = res.Succeeded
+		} else {
+			sum, err := client.QuarantineMessages(box, req.IDs)
+			if err != nil {
+				return nil, quarantineError(err)
+			}
+			invalidateMailboxListCache()
+			data, _ = globalData(sum, "quarantined in "+box)
+			handled = succeededIDs(sum)
 		}
-		sum, err := client.QuarantineMessages(box, req.IDs)
-		if err != nil {
-			return nil, quarantineError(err)
-		}
-		invalidateMailboxListCache()
-		return globalData(sum, "quarantined in "+box)
+		report := confirmMoved(client, before, handled, fixedDest(box))
+		attachReport(data, report)
+		return data, relocationError(report, box)
 	})
 }
 
