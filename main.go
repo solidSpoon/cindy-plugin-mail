@@ -17,7 +17,7 @@ import (
 	"github.com/intelligrit/mail-app-cli/pkg/api"
 )
 
-const version = "2.0.0"
+const version = "2.0.1"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout))

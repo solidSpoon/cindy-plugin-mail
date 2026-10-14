@@ -5,7 +5,7 @@
   "name": "Mail (Mail.app)",
   "description": "Read and organize the real Mail.app mailbox on this Mac through the bundled mail-app-cli: accounts, mailboxes, messages, bodies, attachments and drafts. It cannot send mail and it cannot delete mail.",
   "whenToUse": "Use when the user asks about their own email: unread mail, a mailbox, a specific message or attachment, searching mail, marking/archiving/quarantining messages, reading a message body, or drafting a reply for review in Mail.app.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "spoon",
   "icon": "assets/icon.png",
   "entry": "main.js",

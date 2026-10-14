@@ -297,8 +297,10 @@ func init() {
 // ------------------------------------------------------- messages.quarantine
 
 type MessagesQuarantineParams struct {
-	IDs    []string    `json:"ids" req:"1"`
-	Box    string      `json:"box,omitempty" desc:"holding mailbox name, created in each account when missing"`
+	IDs []string `json:"ids" req:"1"`
+	// def has to mirror mail.DefaultQuarantineMailbox: a struct tag cannot
+	// reference a constant.
+	Box    string      `json:"box,omitempty" def:"待删除" desc:"holding mailbox name (default 待删除); it must already exist in Mail.app, created there by the user - a mailbox created by scripting stays local-only and this tool never creates one"`
 	In     *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
 	DryRun bool        `json:"dryRun,omitempty"`
 }
