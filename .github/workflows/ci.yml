@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
+
+  plugin:
+    name: cindy plugin package
+    runs-on: macos-latest
+    steps:
+      # Full clone: go build stamps vcs.revision into the binary, which is what
+      # make verify reads back to prove the bundle was built from this commit.
+      # A shallow checkout can make that stamping fail outright.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Universal so the package is not locked to one Mac architecture.
+      - name: Build the bundled CLI
+        run: make plugin-universal
+
+      # Manifest, declared paths, manual, locale/manifest alignment, and the
+      # executable bit on bin/. Then assert the bundled binary was built from
+      # the commit being built, which is what catches a stale bundle.
+      - name: Validate the plugin source
+        run: make verify
+
+      - name: Build the .cindy package
+        run: make bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cindy-package
+          path: ghost/*.cindy
+          if-no-files-found: error

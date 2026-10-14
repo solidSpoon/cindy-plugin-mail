@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 3,
+  "minCindyVersion": "0.1.64",
+  "id": "mail-app-cli",
+  "name": "Mail (Mail.app)",
+  "description": "Read and organize the real Mail.app mailbox on this Mac through the bundled mail-app-cli: accounts, mailboxes, messages, bodies, attachments and drafts. It cannot send mail and it cannot delete mail.",
+  "whenToUse": "Use when the user asks about their own email: unread mail, a mailbox, a specific message or attachment, searching mail, marking/archiving/quarantining messages, reading a message body, or drafting a reply for review in Mail.app.",
+  "version": "1.0.0",
+  "author": "spoon",
+  "icon": "assets/icon.png",
+  "entry": "main.js",
+  "launch": "on-demand",
+  "command": "mail",
+  "locales": {
+    "en": "locales/en.json",
+    "zh-CN": "locales/zh-CN.json"
+  },
+  "manual": {
+    "items": [
+      {
+        "dir": "manual/operations",
+        "name": "operations",
+        "description": "mail-app-cli 的读写工作流、参数约定、性能代价与踩坑表 (workflows, conventions, pitfalls)"
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "list_tools",
+      "description": "List the operations this plugin can run. Call with no category for an overview (category name + operation count); call with a category to get every operation in it with its parameters and that category's RULES. Read the RULES before calling call_tool.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string",
+            "description": "Category name from the overview: read | write | attachment | system"
+          }
+        }
+      }
+    },
+    {
+      "name": "call_tool",
+      "description": "Run one operation against the real Mail.app on this Mac. name comes from list_tools; args is that operation's own parameter object, passed through to the bundled mail-app-cli (for example {\"action\":\"messages.unified\",\"params\":{\"box\":\"unread\"}} is args {\"box\":\"unread\"} for name \"messages.unified\"). Returns the raw result envelope { ok, okCount, failed, results[] } where each result has ok, dryRun, data and error{code,hint}: branch on error.code, never on the prose. This plugin cannot send mail and cannot delete mail. Dry-run (dryRun:true) anything that touches more than one message before applying it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "title": "Operation",
+            "type": "string",
+            "description": "Operation name from list_tools, e.g. messages.unified"
+          },
+          "args": {
+            "title": "Arguments",
+            "type": "object",
+            "description": "The operation's parameter object, e.g. {\"box\":\"unread\",\"limit\":10,\"format\":\"compact\"}. Unknown or misspelled fields are rejected, never ignored. Pass {} to get a parameter error that names the problem."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  ],
+  "confirm": true,
+  "node": {
+    "entry": "node/worker.cjs",
+    "protocol": "json-rpc-stdio",
+    "lifecycle": "on-demand",
+    "idleTimeoutSeconds": 120
+  }
+}

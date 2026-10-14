@@ -1,0 +1,85 @@
+name: release
+
+# Tag to publish:  git tag v1.0.0 && git push origin v1.0.0
+# The tag must match "version" in ghost/ghost.json.
+#
+# What this can and cannot do:
+#   - can: build the universal binary, validate the package, produce the .cindy,
+#     and attach it to a GitHub Release.
+#   - cannot: run ghost_forge_pack / ghost_forge_install. Those are tools of the
+#     Cindy host application, not a CLI; the only CLI Cindy ships is a launcher
+#     (`open -a Cindy.app -- <path>`). So the authoritative package validation and
+#     the actual install still happen on a machine running Cindy, from the
+#     downloaded artifact.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    runs-on: macos-latest
+    steps:
+      # Full clone: go build stamps vcs.revision into the binary, and make verify
+      # reads it back to prove the bundle was built from the tagged commit.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build the bundled CLI (arm64 + x86_64)
+        run: make plugin-universal
+
+      - name: Check the tag against ghost/ghost.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(node -p "require('./ghost/ghost.json').version")"
+          echo "tag=$tag_version  ghost.json=$manifest_version"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match ghost.json version $manifest_version"
+            exit 1
+          fi
+
+      - name: Validate the plugin source
+        run: make verify
+
+      - name: Build the .cindy package
+        run: make bundle
+
+      - name: Stage the release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp ghost/*.cindy dist/
+          cp ghost/bin/mail-app-cli dist/mail-app-cli-darwin-universal
+          chmod 755 dist/mail-app-cli-darwin-universal
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cindy-package
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

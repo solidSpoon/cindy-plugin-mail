@@ -26,3 +26,8 @@ go.work
 *.swp
 *.swo
 *~
+
+# Cindy plugin build output: the binary is built by 'make plugin' / CI, and the
+# .cindy is produced by ghost_forge_pack or 'make bundle'. Neither is a source.
+/ghost/bin/
+/ghost/*.cindy

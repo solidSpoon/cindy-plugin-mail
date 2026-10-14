@@ -1,0 +1,29 @@
+{
+  "name": "邮箱 (Mail.app)",
+  "description": "通过随包的 mail-app-cli 操作本机 Mail.app 的真实邮箱：账户、邮箱、邮件、正文、附件与草稿。它不能发信，也不能删信。",
+  "whenToUse": "用户问自己的邮件时找我：未读邮件、收件箱、某封邮件或附件、搜索邮件、标记/归档/隔离、读一封邮件的正文，或起草一封让他在 Mail.app 里确认发送的回信。",
+  "tools": {
+    "list_tools": {
+      "description": "列出本插件可执行的操作。不传 category 返回类目概览（类目名 + 操作数）；传 category 返回该类目下每个操作的名称、参数，以及该类目的 RULES。调 call_tool 之前先读 RULES。",
+      "parameters": {
+        "/properties/category": {
+          "title": "类目",
+          "description": "来自概览的类目名：read | write | attachment | system"
+        }
+      }
+    },
+    "call_tool": {
+      "description": "对这台 Mac 上真实的 Mail.app 执行一个操作。name 来自 list_tools；args 是该操作自己的参数对象，原样透传给随包的 mail-app-cli（例如 {\"action\":\"messages.unified\",\"params\":{\"box\":\"unread\"}} 对应 name=\"messages.unified\" 时 args={\"box\":\"unread\"}）。返回原始结果信封 { ok, okCount, failed, results[] }，每个 result 有 ok、dryRun、data、error{code,hint}：请按 error.code 分支，不要解析文案。本插件不能发信、不能删信；涉及多封邮件的写操作先 dryRun:true 预演再执行。",
+      "parameters": {
+        "/properties/name": {
+          "title": "操作名",
+          "description": "来自 list_tools 的操作名，例如 messages.unified"
+        },
+        "/properties/args": {
+          "title": "参数",
+          "description": "该操作的参数对象，例如 {\"box\":\"unread\",\"limit\":10,\"format\":\"compact\"}。未知或拼错的字段会被直接拒绝，不会静默忽略。传 {} 可以拿回一个指出问题的参数错误。"
+        }
+      }
+    }
+  }
+}
