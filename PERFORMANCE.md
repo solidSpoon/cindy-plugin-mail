@@ -83,6 +83,23 @@ implementation lowercases `subject()` and `sender()` and matches on those, so
 "full-text search would hang" is an inference about reading every body in turn —
 not something search does today.
 
+### `source()` is the cheap way to the real URLs
+
+`content()` returns the *rendered* body, in which `<a href="…">` has been
+collapsed to its anchor text. `message.source()` returns the message as it
+arrived, so the text/html part and the `List-Unsubscribe` headers survive:
+
+| Call | Result on a 45 KB Gmail newsletter (id 7811) |
+|---|---|
+| `content()` | 1.77 s, 1,704 characters, no URLs |
+| `source()` | **157 ms**, 44,840 characters, `multipart/alternative`, real unsubscribe URL present |
+
+`source()` costs one read of the whole message (attachments included, so it
+scales with the message rather than with the body), and it is still a body read,
+so the warning above applies to it. The MIME parsing happens in Go
+(`pkg/rawmail`), not in the scripting layer, which is what makes
+`messages.show` with `body:"html"` cheap enough to offer at all.
+
 ## Moves change message IDs
 
 When a message is moved (archive, move, quarantine) Mail assigns it a new ID in the

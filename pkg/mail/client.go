@@ -823,8 +823,17 @@ JSON.stringify(result);
 	return messages, nil
 }
 
-// GetMessageDetailsJSON retrieves full details of a specific message
-func (c *Client) GetMessageDetailsJSON(accountName, mailboxName, messageID string) (*Message, error) {
+// GetMessageDetailsJSON retrieves full details of a specific message.
+//
+// withContent controls whether the body is fetched. Reading a body is the one
+// Apple event that can block Mail.app while a download stalls, and callers that
+// are going to parse the raw source instead do not need the rendered text as
+// well, so it is opt-out rather than always-on.
+func (c *Client) GetMessageDetailsJSON(accountName, mailboxName, messageID string, withContent bool) (*Message, error) {
+	contentExpr := "''"
+	if withContent {
+		contentExpr = "msg.content() || ''"
+	}
 	script := fmt.Sprintf(`
 const mail = Application('Mail');
 let result = null;
@@ -866,7 +875,7 @@ try {
 			read: msg.readStatus(),
 			flagged: msg.flaggedStatus(),
 			messageSize: msg.messageSize(),
-			content: msg.content() || '',
+			content: %s,
 			mailbox: mbox.name(),
 			account: acc.name(),
 			toRecipients: toRecipients,
@@ -881,7 +890,7 @@ try {
 }
 
 JSON.stringify(result);
-`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID))
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), contentExpr)
 
 	output, err := c.runJXA(script)
 	if err != nil {
@@ -894,6 +903,38 @@ JSON.stringify(result);
 	}
 
 	return &message, nil
+}
+
+// GetMessageSource returns the raw RFC 822 source of a message: what Mail.app
+// exposes as `source`, rather than the rendered body that `content` gives.
+// The text/html part, its hyperlinks and the List-Unsubscribe headers survive
+// only in the source.
+func (c *Client) GetMessageSource(accountName, mailboxName, messageID string) (string, error) {
+	script := fmt.Sprintf(`
+const mail = Application('Mail');
+`+jsResolveMailbox+`
+let result = '';
+try {
+	const acc = mail.accounts.byName('%s');
+	const mbox = resolveMailbox(acc, '%s');
+	if (!mbox) throw 'Mailbox not found';
+	const target = resolveMessage(mbox, '%s');
+	if (target) result = target.source() || '';
+} catch (e) {
+	result = '';
+}
+JSON.stringify(result);
+`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID))
+
+	output, err := c.runJXA(script)
+	if err != nil {
+		return "", err
+	}
+	var source string
+	if err := json.Unmarshal([]byte(output), &source); err != nil {
+		return "", fmt.Errorf("unexpected output: %w", err)
+	}
+	return source, nil
 }
 
 // GetAttachmentsJSON retrieves attachments from a message

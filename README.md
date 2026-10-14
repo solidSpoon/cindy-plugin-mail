@@ -157,7 +157,7 @@ the same structs the decoder uses, so it cannot drift from the implementation.
 | `mailboxes.list` | `account`, `counts`, `unreadOnly`, `noCache` |
 | `messages.list` | `account`, `mailbox`, `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
 | `messages.unified` | `box` (`inbox\|unread\|flagged\|sent\|drafts\|trash\|junk`), `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
-| `messages.show` | `message` (`MessageInMailbox`) |
+| `messages.show` | `message` (`MessageInMailbox`) | `body` (`text\|html\|both`) |
 | `messages.search` | `query`, `account`, `mailbox`, `limit`, `format` |
 | `messages.resolve` | `ids` |
 | `attachments.list` | `message` |
@@ -190,6 +190,8 @@ Notes that are easy to get wrong:
 
 - **Identifiers are always quoted strings**, because a Mail.app id is an integer
   that JSON callers would otherwise lose in float formatting.
+- **`message.Content` is rendered text**: hyperlinks are flattened to their
+  anchor text. Use `body: "html"` when the addresses matter.
 - **A move changes the id.** Mail.app assigns the message a new id in the
   destination mailbox, so re-list after `move`, `archive` or `quarantine`.
 - **`draft` never sends.** It reports the draft's `id` and `verified`. If Mail.app
@@ -226,6 +228,36 @@ mail-app-cli '{"action":"messages.show",
                "params":{"message":{"id":"7847",
                                     "in":{"account":"Google","mailbox":"All Mail"}}}}'
 ```
+
+### Getting real hyperlinks out of a message
+
+The default body is Mail.app's *rendered* text, in which every hyperlink has
+already been flattened to its anchor text — which is why "click here to
+unsubscribe" arrives with no address. Ask for the raw source instead and the
+URLs are all still there:
+
+```bash
+mail-app-cli '{"action":"messages.show","params":{
+  "message":{"id":"7811","in":{"account":"Google","mailbox":"Spam"}},
+  "body":"both"}}'
+```
+
+| `body` | Returns |
+|--------|---------|
+| `text` (default) | Mail.app's rendered text in `message.Content` |
+| `html` | `html` (the decoded `text/html` part), `links` (`[{text, href}]`), `listUnsubscribe`, `listUnsubscribeOneClick` |
+| `both` | All of the above, with `message.Content` filled from the source's `text/plain` part |
+
+`listUnsubscribe` comes from the `List-Unsubscribe` header (RFC 2369): the
+sender's own machine-readable unsubscribe route, which mail with no anchor in
+the body at all often still carries. `listUnsubscribeOneClick` reports RFC
+8058's `List-Unsubscribe-Post`, meaning the https entry accepts a bare POST with
+no confirmation page.
+
+The message is still read only once — asking for `html`/`both` replaces the
+rendered-body read rather than adding to it. The trade-offs are size (the source
+is the whole message, attachments included) and that it remains a body read, so
+the caveat above applies to it too.
 
 Propose changes, then apply them:
 

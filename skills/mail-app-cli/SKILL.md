@@ -77,7 +77,7 @@ This matters because unknown parameters are **rejected, never ignored**, at any 
 | `mailboxes.list` | — | `account`, `counts`, `unreadOnly`, `noCache` |
 | `messages.list` | `account`, `mailbox` | `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
 | `messages.unified` | `box` | `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
-| `messages.show` | `message` | — |
+| `messages.show` | `message` | `body` (`text\|html\|both`) |
 | `messages.search` | `query` | `account`, `mailbox`, `limit`, `format` |
 | `messages.resolve` | `ids` | — |
 | `attachments.list` | `message` | — |
@@ -119,6 +119,14 @@ mail-app-cli '{"action":"messages.unified","params":{"box":"inbox","since":"2026
 
 # one message in full
 mail-app-cli '{"action":"messages.show","params":{"message":{"id":"7847","in":{"account":"Google","mailbox":"All Mail"}}}}'
+
+# real hyperlink addresses + the sender's own unsubscribe route
+# (the default body is Mail.app's rendered text, in which URLs are flattened
+#  to anchor text, so `body` is what recovers them)
+mail-app-cli '{"action":"messages.show","params":{
+  "message":{"id":"7811","in":{"account":"Google","mailbox":"Spam"}},
+  "body":"both"}}' \
+  | jq -r '.results[0].data | (.links[] | "\(.text) -> \(.href)"), (.listUnsubscribe[]? | "unsubscribe: \(.)")'
 
 # propose, then apply (quarantine is the safe "get it out of the inbox")
 mail-app-cli '{"action":"messages.quarantine","params":{"ids":["7844","7846"],"dryRun":true}}'
@@ -166,6 +174,7 @@ JSON
 | Expecting fresh counts from cache | `accounts`/`mailboxes` cache 60s, message lists 5 min. Pass `noCache: true` when freshness matters |
 | `withContent` on a big or spam mailbox | It can block Mail.app's whole scripting interface until a body downloads |
 | Searching for body text | `messages.search` never reads bodies, which is why it is cheap; a full-text search is not available. Reading a body at all (`withContent`, `messages.show`) is the risky call |
+| Reporting "there is no unsubscribe link" | The default body is Mail.app's *rendered* text, where every URL has been flattened to anchor text. Use `body: "html"` or `"both"` to get `links` (real hrefs) and `listUnsubscribe` (RFC 2369/8058, the sender's own route — often present when the body has no anchor at all) |
 
 Accounts on this machine: `Exchange`, `iCloud`, `Google`.
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/intelligrit/mail-app-cli/pkg/cache"
 	"github.com/intelligrit/mail-app-cli/pkg/mail"
+	"github.com/intelligrit/mail-app-cli/pkg/rawmail"
 )
 
 // Cache lifetimes. Accounts and mailboxes used to be cached for 24h, which made
@@ -244,12 +245,18 @@ func init() {
 
 type MessagesShowParams struct {
 	Message MessageInMailbox `json:"message" req:"1"`
+	Body    string           `json:"body,omitempty" enum:"text|html|both" def:"text" desc:"text: Mail.app's rendered body, in which hyperlinks are already flattened to their anchor text. html: parse the raw message source and return html, links and listUnsubscribe. both: that, plus the plain-text part parsed from the source."`
 }
 
 func init() {
-	Register("messages.show", "Show one message in full, including its body and thread headers", func(req MessagesShowParams) (any, error) {
+	Register("messages.show", "Show one message in full, including its body and thread headers. body:\"html\" recovers the hyperlinks and List-Unsubscribe route that the rendered text loses", func(req MessagesShowParams) (any, error) {
+		client := mail.NewClient()
 		in := req.Message.In
-		message, err := mail.NewClient().GetMessageDetailsJSON(in.Account, in.Mailbox, req.Message.ID)
+		// Asking for the source replaces the rendered-body read rather than
+		// adding to it, so either way the message is read once.
+		wantSource := req.Body == "html" || req.Body == "both"
+
+		message, err := client.GetMessageDetailsJSON(in.Account, in.Mailbox, req.Message.ID, !wantSource)
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to read message %s: %v", req.Message.ID, err)
 		}
@@ -258,7 +265,29 @@ func init() {
 				req.Message.ID, in.Account, in.Mailbox).
 				withHint("re-list the mailbox first: mutations assign new ids")
 		}
-		return map[string]any{"message": message}, nil
+
+		data := map[string]any{"message": message}
+		if !wantSource {
+			return data, nil
+		}
+
+		raw, err := client.GetMessageSource(in.Account, in.Mailbox, req.Message.ID)
+		if err != nil {
+			return nil, errf(CodeScriptFailed, "failed to read the raw source of %s: %v", req.Message.ID, err)
+		}
+		parsed, perr := rawmail.Parse(raw)
+		if perr != nil {
+			return nil, errf(CodeScriptFailed, "could not parse the raw source of %s: %v", req.Message.ID, perr).
+				withHint(`the rendered body is still available with "body":"text"`)
+		}
+		if parsed.Text != "" {
+			message.Content = parsed.Text
+		}
+		data["html"] = parsed.HTML
+		data["links"] = parsed.Links
+		data["listUnsubscribe"] = parsed.ListUnsubscribe
+		data["listUnsubscribeOneClick"] = parsed.ListUnsubscribeOneClick
+		return data, nil
 	})
 }
 
