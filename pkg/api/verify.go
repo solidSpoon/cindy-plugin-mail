@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/intelligrit/mail-app-cli/pkg/mail"
 )
@@ -20,12 +21,22 @@ import (
 
 // moveReport is what the destination read-back concluded.
 type moveReport struct {
-	Verified     []string `json:"verified"`
-	NotPersisted []string `json:"notPersisted,omitempty"`
+	Verified      []string `json:"verified"`
+	NotPersisted  []string `json:"notPersisted,omitempty"`
+	StillInSource []string `json:"stillInSource,omitempty"`
 	// Unverifiable holds ids whose Message-ID could not be read, so no claim is
 	// made about them either way.
 	Unverifiable []string `json:"unverifiable,omitempty"`
 	Warnings     []string `json:"warnings,omitempty"`
+}
+
+func isAllMailMailbox(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "all mail", "[gmail]/all mail", "所有邮件":
+		return true
+	default:
+		return false
+	}
 }
 
 // destResolver names the mailbox a relocation was aimed at, per account.
@@ -50,8 +61,10 @@ func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []
 		wanted[id] = true
 	}
 
-	// account -> the Message-IDs we expect to find there
+	// account -> the Message-IDs we expect to find in dest
 	expect := map[string]map[string][]string{}
+	// account -> sourceMailbox -> the Message-IDs that must leave sourceMailbox
+	sourceExpect := map[string]map[string]map[string][]string{}
 	for _, loc := range before {
 		if !wanted[loc.ID] || !loc.Exists {
 			continue
@@ -64,8 +77,20 @@ func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []
 			expect[loc.Account] = map[string][]string{}
 		}
 		expect[loc.Account][loc.MessageID] = append(expect[loc.Account][loc.MessageID], loc.ID)
+
+		if loc.Mailbox != "" && !isAllMailMailbox(loc.Mailbox) {
+			if sourceExpect[loc.Account] == nil {
+				sourceExpect[loc.Account] = map[string]map[string][]string{}
+			}
+			if sourceExpect[loc.Account][loc.Mailbox] == nil {
+				sourceExpect[loc.Account][loc.Mailbox] = map[string][]string{}
+			}
+			sourceExpect[loc.Account][loc.Mailbox][loc.MessageID] = append(
+				sourceExpect[loc.Account][loc.Mailbox][loc.MessageID], loc.ID)
+		}
 	}
 
+	destByAccount := map[string]string{}
 	for account, byMessageID := range expect {
 		mailbox, err := dest(account)
 		if err != nil {
@@ -76,6 +101,7 @@ func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []
 			}
 			continue
 		}
+		destByAccount[account] = mailbox
 		present, err := client.MailboxMessageIDs(account, mailbox)
 		if err != nil {
 			report.Warnings = append(report.Warnings,
@@ -97,6 +123,33 @@ func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []
 			report.NotPersisted = append(report.NotPersisted, ids...)
 		}
 	}
+
+	// Also verify the messages actually left their source mailbox (catches Gmail
+	// label-copy behavior where the destination receives a label while INBOX
+	// still retains the message).
+	for account, bySource := range sourceExpect {
+		destMailbox := destByAccount[account]
+		for sourceMailbox, byMessageID := range bySource {
+			if sourceMailbox == destMailbox {
+				continue
+			}
+			present, err := client.MailboxMessageIDs(account, sourceMailbox)
+			if err != nil {
+				report.Warnings = append(report.Warnings,
+					fmt.Sprintf("could not re-check source %s/%s: %v", account, sourceMailbox, err))
+				continue
+			}
+			stillHere := make(map[string]bool, len(present))
+			for _, messageID := range present {
+				stillHere[messageID] = true
+			}
+			for messageID, ids := range byMessageID {
+				if stillHere[messageID] {
+					report.StillInSource = append(report.StillInSource, ids...)
+				}
+			}
+		}
+	}
 	return report
 }
 
@@ -107,13 +160,19 @@ func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []
 // an untyped nil: a nil *Error returned as an error is not nil, which silently
 // turned confirmed moves into failures.
 func relocationError(report *moveReport, destination string) error {
-	if len(report.NotPersisted) == 0 {
-		return nil
+	if len(report.NotPersisted) > 0 {
+		return errf(CodeMoveNotPersisted,
+			"%d of %d messages did not stay in %s; Mail.app reported the move but the destination never received them",
+			len(report.NotPersisted), len(report.NotPersisted)+len(report.Verified), destination).
+			withHint("a mailbox created by scripting exists only locally and the server sends the message back; create the destination in Mail.app itself, or move to a mailbox that already exists")
 	}
-	return errf(CodeMoveNotPersisted,
-		"%d of %d messages did not stay in %s; Mail.app reported the move but the destination never received them",
-		len(report.NotPersisted), len(report.NotPersisted)+len(report.Verified), destination).
-		withHint("a mailbox created by scripting exists only locally and the server sends the message back; create the destination in Mail.app itself, or move to a mailbox that already exists")
+	if len(report.StillInSource) > 0 {
+		return errf(CodeMoveNotPersisted,
+			"%d messages appeared in %s but remained in the source mailbox",
+			len(report.StillInSource), destination).
+			withHint("for Gmail accounts, scope the move/quarantine with \"in\":{\"account\":\"Google\",\"mailbox\":\"INBOX\"} so Mail.app removes the INBOX label")
+	}
+	return nil
 }
 
 // attachReport adds the confirmation to a mutation's data map.
@@ -123,11 +182,15 @@ func attachReport(data any, report *moveReport) {
 		return
 	}
 	m["confirmed"] = len(report.Verified)
+	m["leftSource"] = len(report.StillInSource) == 0
 	if len(report.Verified) > 0 {
 		m["verified"] = report.Verified
 	}
 	if len(report.NotPersisted) > 0 {
 		m["notPersisted"] = report.NotPersisted
+	}
+	if len(report.StillInSource) > 0 {
+		m["stillInSource"] = report.StillInSource
 	}
 	if len(report.Unverifiable) > 0 {
 		m["unverifiable"] = report.Unverifiable

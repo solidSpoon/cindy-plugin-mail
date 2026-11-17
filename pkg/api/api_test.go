@@ -308,3 +308,145 @@ func TestCompactProjectionShape(t *testing.T) {
 		t.Errorf("full projection lost fields: %s", raw)
 	}
 }
+
+func TestCombineMutationError(t *testing.T) {
+	reloc := errf(CodeMoveNotPersisted, "not persisted")
+	partial := errf(CodePartialFailure, "partial")
+
+	if got := combineMutationError(reloc, partial); got != reloc {
+		t.Errorf("relocation error should win over partial failure, got %v", got)
+	}
+	if got := combineMutationError(nil, partial); got != partial {
+		t.Errorf("partial failure must not be swallowed when relocation succeeded, got %v", got)
+	}
+	if got := combineMutationError(nil, nil); got != nil {
+		t.Errorf("expected nil when both errors are nil, got %v", got)
+	}
+}
+
+func TestDefaultQuarantineBoxEnv(t *testing.T) {
+	t.Setenv("MAIL_APP_CLI_QUARANTINE_BOX", "")
+	if got := defaultQuarantineBox(); got != mail.DefaultQuarantineMailbox {
+		t.Errorf("got %q, want %q", got, mail.DefaultQuarantineMailbox)
+	}
+	t.Setenv("MAIL_APP_CLI_QUARANTINE_BOX", "  Quarantine  ")
+	if got := defaultQuarantineBox(); got != "Quarantine" {
+		t.Errorf("got %q, want %q", got, "Quarantine")
+	}
+}
+
+func TestPartitionLocations(t *testing.T) {
+	locs := []mail.MessageLocation{
+		{ID: "1", Exists: true, Account: "A", Mailbox: "INBOX"},
+		{ID: "2", Exists: false},
+	}
+	wouldAffect, missing := partitionLocations(locs)
+	if len(wouldAffect) != 1 || wouldAffect[0].ID != "1" {
+		t.Errorf("unexpected wouldAffect: %+v", wouldAffect)
+	}
+	if len(missing) != 1 || missing[0] != "2" {
+		t.Errorf("unexpected missing: %+v", missing)
+	}
+}
+
+func TestSchemaIncludesQuarantineMarkRead(t *testing.T) {
+	schema := schemaOf(t)
+	for _, a := range schema.Actions {
+		if a.Name == "messages.quarantine" {
+			props := a.Params["properties"].(map[string]any)
+			if _, ok := props["markRead"]; !ok {
+				t.Errorf("messages.quarantine should expose markRead in schema")
+			}
+			return
+		}
+	}
+	t.Fatal("messages.quarantine not found in schema")
+}
+
+func TestFilterMessagesByQueryAndPaginate(t *testing.T) {
+	msgs := []mail.Message{
+		{ID: "1", Subject: "Weekly Digest", Sender: "news@acme.com"},
+		{ID: "2", Subject: "Invoice #42", Sender: "Billing <bill@vendor.com>"},
+		{ID: "3", Subject: "Acme promo", Sender: "noreply@promo.io"},
+	}
+	filtered := filterMessagesByQuery(msgs, "ACME")
+	if len(filtered) != 2 || filtered[0].ID != "1" || filtered[1].ID != "3" {
+		t.Fatalf("unexpected query filter result: %+v", filtered)
+	}
+	page, hasMore := paginateMessages(filtered, 0, 1)
+	if len(page) != 1 || page[0].ID != "1" || !hasMore {
+		t.Fatalf("unexpected page 1: %+v hasMore=%v", page, hasMore)
+	}
+	page2, hasMore2 := paginateMessages(filtered, 1, 1)
+	if len(page2) != 1 || page2[0].ID != "3" || hasMore2 {
+		t.Fatalf("unexpected page 2: %+v hasMore=%v", page2, hasMore2)
+	}
+}
+
+func TestBuildDigestGroupsAndSorts(t *testing.T) {
+	msgs := []mail.Message{
+		{ID: "1", Sender: "A <a@x.com>", Subject: "S1", DateReceived: "2026-11-17T10:00:00Z", Read: false},
+		{ID: "2", Sender: "B <b@x.com>", Subject: "B1", DateReceived: "2026-11-17T11:00:00Z", Read: true},
+		{ID: "3", Sender: "a <a@x.com>", Subject: "S2", DateReceived: "2026-11-17T12:00:00Z", Read: false},
+		{ID: "4", Sender: "A <a@x.com>", Subject: "S3", DateReceived: "2026-11-17T13:00:00Z", Read: true},
+		{ID: "5", Sender: "A <a@x.com>", Subject: "S4", DateReceived: "2026-11-17T14:00:00Z", Read: false},
+	}
+	groups := buildDigest(msgs)
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2", len(groups))
+	}
+	if groups[0].Count != 4 || groups[0].UnreadCount != 3 || len(groups[0].Subjects) != 3 || groups[0].Newest != "2026-11-17T14:00:00Z" {
+		t.Fatalf("unexpected top group: %+v", groups[0])
+	}
+	if groups[1].Count != 1 {
+		t.Fatalf("unexpected second group: %+v", groups[1])
+	}
+}
+
+func TestDigestTargetValidation(t *testing.T) {
+	e := firstError(t, `{"action":"messages.digest","params":{"box":"inbox","account":"Google","mailbox":"INBOX"}}`)
+	if !strings.Contains(e.Message, "cannot be combined") {
+		t.Errorf("expected mutual exclusion error, got %q", e.Message)
+	}
+	e = firstError(t, `{"action":"messages.digest","params":{"limit":10}}`)
+	if !strings.Contains(e.Message, "give box, or both account and mailbox") {
+		t.Errorf("expected missing target error, got %q", e.Message)
+	}
+}
+
+func TestStillInSourceVerification(t *testing.T) {
+	if !isAllMailMailbox("All Mail") || !isAllMailMailbox("[Gmail]/All Mail") || isAllMailMailbox("INBOX") {
+		t.Fatal("unexpected isAllMailMailbox classification")
+	}
+	rep := &moveReport{Verified: []string{"1"}, StillInSource: []string{"1"}}
+	err := relocationError(rep, "待删除")
+	if err == nil {
+		t.Fatal("expected relocationError when StillInSource is non-empty")
+	}
+	if apiErr, ok := err.(*Error); !ok || apiErr.Code != CodeMoveNotPersisted {
+		t.Fatalf("expected %s, got %v", CodeMoveNotPersisted, err)
+	}
+	data := map[string]any{}
+	attachReport(data, rep)
+	if data["leftSource"] != false {
+		t.Errorf("expected leftSource=false, got %v", data["leftSource"])
+	}
+}
+
+func TestSchemaListDefaultLimitIs60(t *testing.T) {
+	schema := schemaOf(t)
+	for _, a := range schema.Actions {
+		if a.Name == "messages.list" {
+			props := a.Params["properties"].(map[string]any)
+			lim := props["limit"].(map[string]any)
+			if lim["default"] != "60" {
+				t.Errorf("messages.list.limit default = %v, want 60", lim["default"])
+			}
+			if _, ok := props["query"]; !ok {
+				t.Errorf("messages.list should expose query in schema")
+			}
+			return
+		}
+	}
+	t.Fatal("messages.list not found in schema")
+}

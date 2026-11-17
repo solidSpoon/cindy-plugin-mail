@@ -1,6 +1,7 @@
 package api
 
 import (
+	"os"
 	"strings"
 
 	"github.com/intelligrit/mail-app-cli/pkg/mail"
@@ -21,6 +22,15 @@ func dryRunLocations(ids []string) (any, error) {
 	if err != nil {
 		return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
 	}
+	wouldAffect, missing := partitionLocations(locations)
+	return map[string]any{
+		"dryRun":      true,
+		"wouldAffect": wouldAffect,
+		"missing":     missing,
+	}, nil
+}
+
+func partitionLocations(locations []mail.MessageLocation) ([]mail.MessageLocation, []string) {
 	wouldAffect := []mail.MessageLocation{}
 	missing := []string{}
 	for _, loc := range locations {
@@ -30,11 +40,82 @@ func dryRunLocations(ids []string) (any, error) {
 			missing = append(missing, loc.ID)
 		}
 	}
-	return map[string]any{
-		"dryRun":      true,
-		"wouldAffect": wouldAffect,
-		"missing":     missing,
-	}, nil
+	return wouldAffect, missing
+}
+
+func defaultQuarantineBox() string {
+	if v := strings.TrimSpace(os.Getenv("MAIL_APP_CLI_QUARANTINE_BOX")); v != "" {
+		return v
+	}
+	return mail.DefaultQuarantineMailbox
+}
+
+func checkDestMailboxes(client *mail.Client, wouldAffect []mail.MessageLocation, ref *mailboxRef, dest string, holding bool) *Error {
+	seen := map[string]bool{}
+	var accounts []string
+	if ref != nil && ref.account != "" {
+		seen[ref.account] = true
+		accounts = append(accounts, ref.account)
+	}
+	for _, loc := range wouldAffect {
+		if loc.Account != "" && !seen[loc.Account] {
+			seen[loc.Account] = true
+			accounts = append(accounts, loc.Account)
+		}
+	}
+	for _, account := range accounts {
+		mailboxes, err := client.GetMailboxesJSON(account, false)
+		if err != nil {
+			return errf(CodeScriptFailed, "failed to verify destination mailbox %q in %s: %v", dest, account, err)
+		}
+		found := false
+		for _, mb := range mailboxes {
+			if mb.Name == dest {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if holding {
+				return errf(CodeHoldingBoxMissing, "holding mailbox %q does not exist in %s", dest, account).
+					withHint("create the mailbox in Mail.app, or pass a box that exists")
+			}
+			return errf(CodeMailboxMissing, "destination mailbox %q does not exist in %s", dest, account).
+				withHint("create the mailbox in Mail.app first, or list existing mailboxes with mailboxes.list")
+		}
+	}
+	return nil
+}
+
+func invalidateLocationsCache(locations []mail.MessageLocation, destMailbox string) {
+	seen := map[string]bool{}
+	for _, loc := range locations {
+		if !loc.Exists || loc.Account == "" {
+			continue
+		}
+		if loc.Mailbox != "" {
+			key := loc.Account + "\x00" + loc.Mailbox
+			if !seen[key] {
+				seen[key] = true
+				invalidateMailboxCache(loc.Account, loc.Mailbox)
+			}
+		}
+		if destMailbox != "" {
+			key := loc.Account + "\x00" + destMailbox
+			if !seen[key] {
+				seen[key] = true
+				invalidateMailboxCache(loc.Account, destMailbox)
+			}
+		}
+	}
+	invalidateMailboxListCache()
+}
+
+func combineMutationError(relocErr, partialErr error) error {
+	if relocErr != nil {
+		return relocErr
+	}
+	return partialErr
 }
 
 func mutationData(res *mail.MutationResult, verb string) (any, error) {
@@ -140,6 +221,8 @@ func init() {
 				if e != nil && out["error"] == nil {
 					out["error"] = e.Error()
 				}
+				invalidateMailboxCache("", "")
+				invalidateMailboxListCache()
 			}
 		}
 
@@ -174,6 +257,8 @@ func init() {
 				if e != nil && out["error"] == nil {
 					out["error"] = e.Error()
 				}
+				invalidateMailboxCache("", "")
+				invalidateMailboxListCache()
 			}
 		}
 
@@ -196,19 +281,33 @@ type MessagesMoveParams struct {
 
 func init() {
 	Register("messages.move", "Move messages to another mailbox. The moved messages get new ids in the destination, and the destination is read back to confirm they arrived", func(req MessagesMoveParams) (any, error) {
-		if req.DryRun {
-			return dryRunLocations(req.IDs)
-		}
 		ref := splitRef(req.In)
 		client := mail.NewClient()
+		if req.DryRun {
+			locations, err := client.ResolveMessages(req.IDs)
+			if err != nil {
+				return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
+			}
+			wouldAffect, missing := partitionLocations(locations)
+			if e := checkDestMailboxes(client, wouldAffect, ref, req.To, false); e != nil {
+				return nil, e
+			}
+			return map[string]any{
+				"dryRun":      true,
+				"to":          req.To,
+				"wouldAffect": wouldAffect,
+				"missing":     missing,
+			}, nil
+		}
 		before, err := client.ResolveMessages(req.IDs)
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
 		}
 		verb := "moved to " + req.To
 		var (
-			data    any
-			handled []string
+			data       any
+			handled    []string
+			partialErr error
 		)
 		if ref != nil {
 			res, err := client.MoveMessages(ref.account, ref.mailbox, req.IDs, req.To)
@@ -217,19 +316,21 @@ func init() {
 			}
 			invalidateMailboxCache(ref.account, ref.mailbox)
 			invalidateMailboxCache(ref.account, req.To)
-			data, _ = mutationData(res, verb)
+			invalidateMailboxListCache()
+			data, partialErr = mutationData(res, verb)
 			handled = res.Succeeded
 		} else {
 			sum, err := client.MutateMessagesGlobal(req.IDs, "move", req.To)
 			if err != nil {
 				return nil, errf(CodeScriptFailed, "move failed: %v", err)
 			}
-			data, _ = globalData(sum, verb)
+			invalidateLocationsCache(before, req.To)
+			data, partialErr = globalData(sum, verb)
 			handled = succeededIDs(sum)
 		}
 		report := confirmMoved(client, before, handled, fixedDest(req.To))
 		attachReport(data, report)
-		return data, relocationError(report, req.To)
+		return data, combineMutationError(relocationError(report, req.To), partialErr)
 	})
 }
 
@@ -239,29 +340,59 @@ type MessagesQuarantineParams struct {
 	IDs []string `json:"ids" req:"1"`
 	// def has to mirror mail.DefaultQuarantineMailbox: a struct tag cannot
 	// reference a constant.
-	Box    string      `json:"box,omitempty" def:"待删除" desc:"holding mailbox name (default 待删除); it must already exist in Mail.app, created there by the user - a mailbox created by scripting stays local-only and this tool never creates one"`
-	In     *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
-	DryRun bool        `json:"dryRun,omitempty"`
+	Box      string      `json:"box,omitempty" def:"待删除" desc:"holding mailbox name (default 待删除, or MAIL_APP_CLI_QUARANTINE_BOX); it must already exist in Mail.app, created there by the user - a mailbox created by scripting stays local-only and this tool never creates one"`
+	In       *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
+	MarkRead bool        `json:"markRead,omitempty" desc:"also mark the quarantined messages as read before moving"`
+	DryRun   bool        `json:"dryRun,omitempty"`
 }
 
 func init() {
 	Register("messages.quarantine", "Park messages in a holding mailbox that already exists on the server. This is the safe replacement for deleting: nothing is destroyed, the move is reversible, and the destination is read back to confirm it arrived", func(req MessagesQuarantineParams) (any, error) {
-		if req.DryRun {
-			return dryRunLocations(req.IDs)
-		}
 		ref := splitRef(req.In)
 		box := req.Box
 		if box == "" {
-			box = mail.DefaultQuarantineMailbox
+			box = defaultQuarantineBox()
 		}
 		client := mail.NewClient()
+		if req.DryRun {
+			locations, err := client.ResolveMessages(req.IDs)
+			if err != nil {
+				return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
+			}
+			wouldAffect, missing := partitionLocations(locations)
+			if e := checkDestMailboxes(client, wouldAffect, ref, box, true); e != nil {
+				return nil, e
+			}
+			out := map[string]any{
+				"dryRun":      true,
+				"box":         box,
+				"wouldAffect": wouldAffect,
+				"missing":     missing,
+			}
+			if req.MarkRead {
+				out["markRead"] = true
+			}
+			return out, nil
+		}
 		before, err := client.ResolveMessages(req.IDs)
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
 		}
+		if req.MarkRead {
+			if ref != nil {
+				if _, err := client.MarkMessages(ref.account, ref.mailbox, req.IDs, true); err != nil {
+					return nil, errf(CodeScriptFailed, "mark read before quarantine failed: %v", err)
+				}
+			} else {
+				if _, err := client.MutateMessagesGlobal(req.IDs, "read", ""); err != nil {
+					return nil, errf(CodeScriptFailed, "mark read before quarantine failed: %v", err)
+				}
+			}
+		}
 		var (
-			data    any
-			handled []string
+			data       any
+			handled    []string
+			partialErr error
 		)
 		if ref != nil {
 			res, err := client.QuarantineMessagesIn(ref.account, ref.mailbox, box, req.IDs)
@@ -271,20 +402,23 @@ func init() {
 			invalidateMailboxCache(ref.account, ref.mailbox)
 			invalidateMailboxCache(ref.account, box)
 			invalidateMailboxListCache()
-			data, _ = mutationData(res, "quarantined in "+box)
+			data, partialErr = mutationData(res, "quarantined in "+box)
 			handled = res.Succeeded
 		} else {
 			sum, err := client.QuarantineMessages(box, req.IDs)
 			if err != nil {
 				return nil, quarantineError(err)
 			}
-			invalidateMailboxListCache()
-			data, _ = globalData(sum, "quarantined in "+box)
+			invalidateLocationsCache(before, box)
+			data, partialErr = globalData(sum, "quarantined in "+box)
 			handled = succeededIDs(sum)
+		}
+		if m, ok := data.(map[string]any); ok && req.MarkRead {
+			m["markedRead"] = true
 		}
 		report := confirmMoved(client, before, handled, fixedDest(box))
 		attachReport(data, report)
-		return data, relocationError(report, box)
+		return data, combineMutationError(relocationError(report, box), partialErr)
 	})
 }
 
