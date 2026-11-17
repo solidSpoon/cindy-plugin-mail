@@ -37,26 +37,6 @@ func fixedDest(name string) destResolver {
 	return func(string) (string, error) { return name, nil }
 }
 
-// archiveDest resolves each account's archive mailbox, which is localized
-// ("Archive", "存档", ...) and has no unified Mail.app accessor.
-func archiveDest(client *mail.Client) destResolver {
-	names := map[string]string{}
-	return func(account string) (string, error) {
-		if name, ok := names[account]; ok {
-			return name, nil
-		}
-		name, err := client.ArchiveMailboxName(account)
-		if err != nil {
-			return "", err
-		}
-		if name == "" {
-			return "", fmt.Errorf("no archive mailbox found in %s", account)
-		}
-		names[account] = name
-		return name, nil
-	}
-}
-
 // confirmMoved reads the destination of every affected account and reports which
 // of the handled ids are really there.
 func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []string, dest destResolver) *moveReport {

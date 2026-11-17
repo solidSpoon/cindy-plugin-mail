@@ -85,7 +85,7 @@ func TestSchemaNeverAdvertisesSendingOrDeleting(t *testing.T) {
 
 func TestSchemaSharesNestedTypesUnderDefs(t *testing.T) {
 	schema := schemaOf(t)
-	for _, want := range []string{"MailboxRef", "MessageInMailbox", "Recipients", "MarkSelect", "StateSet"} {
+	for _, want := range []string{"MailboxRef", "MessageInMailbox", "Recipients", "StateSet"} {
 		if _, ok := schema.Defs[want]; !ok {
 			t.Errorf("def %q is missing; shared parameter types should be described once", want)
 		}
@@ -94,10 +94,6 @@ func TestSchemaSharesNestedTypesUnderDefs(t *testing.T) {
 	if ref.Required == nil || len(ref.Required) != 2 {
 		t.Errorf("MailboxRef should require both fields, got %+v", ref)
 	}
-	if note := schema.Defs["MarkSelect"].Note; !strings.Contains(note, "mode=mailbox") {
-		t.Errorf("MarkSelect should explain its union, got %q", note)
-	}
-
 	// An action that takes a mailbox must point at the def rather than repeat
 	// its fields.
 	var list ActionSpec
@@ -107,9 +103,16 @@ func TestSchemaSharesNestedTypesUnderDefs(t *testing.T) {
 		}
 	}
 	props := list.Params["properties"].(map[string]any)
+	box := props["box"].(map[string]any)
+	if box["type"] != "string" {
+		t.Errorf("messages.list.box should be a string, got %+v", box)
+	}
+	if _, ok := box["enum"]; !ok {
+		t.Errorf("messages.list.box should carry its view enum, got %+v", box)
+	}
 	account := props["account"].(map[string]any)
-	if account["type"] != "string" || account["required"] != true {
-		t.Errorf("messages.list.account should be a required string, got %+v", account)
+	if account["type"] != "string" {
+		t.Errorf("messages.list.account should be a string, got %+v", account)
 	}
 	if account["desc"] == "" {
 		t.Errorf("messages.list.account should carry its description")
@@ -175,32 +178,29 @@ func TestUnknownNestedParameterIsRejected(t *testing.T) {
 	}
 }
 
-func TestMarkSelectUnionRejectsMixedModes(t *testing.T) {
-	e := firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"mailbox","kind":"trash"}}}`)
-	if !strings.Contains(e.Message, "kind") {
-		t.Errorf("unknown field inside the union should be rejected, got %q", e.Message)
+func TestListTargetMustBeUnambiguous(t *testing.T) {
+	// A box view and a named mailbox are alternatives, not a combination.
+	e := firstError(t, `{"action":"messages.list","params":{"box":"unread","account":"Exchange","mailbox":"收件箱"}}`)
+	if !strings.Contains(e.Message, "cannot be combined") {
+		t.Errorf("box plus account/mailbox should be rejected, got %q", e.Message)
 	}
 
-	e = firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"mailbox","account":"Exchange"}}}`)
-	if !strings.Contains(e.Message, "mailbox") {
-		t.Errorf("mode=mailbox without mailbox should be rejected, got %q", e.Message)
+	// The filters belong to the named-mailbox form; a view already filters.
+	e = firstError(t, `{"action":"messages.list","params":{"box":"unread","unread":true}}`)
+	if !strings.Contains(e.Message, "account+mailbox only") {
+		t.Errorf("unread with box should be rejected, got %q", e.Message)
 	}
 
-	e = firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"special","account":"Exchange","kinds":["trash"]}}}`)
-	if !strings.Contains(e.Message, "does not take account") {
-		t.Errorf("mode=special with account should be rejected, got %q", e.Message)
-	}
-
-	e = firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"nonsense"}}}`)
-	if !strings.Contains(e.Message, "mailbox|special") {
-		t.Errorf("mode should be validated as an enum, got %q", e.Message)
+	e = firstError(t, `{"action":"messages.list","params":{"limit":5}}`)
+	if !strings.Contains(e.Message, "give box, or both account and mailbox") {
+		t.Errorf("neither target should be rejected, got %q", e.Message)
 	}
 }
 
-func TestEnumInsideSliceIsValidated(t *testing.T) {
-	e := firstError(t, `{"action":"mailboxes.markRead","params":{"select":{"mode":"special","kinds":["trahs"]}}}`)
-	if !strings.Contains(e.Message, "trash|junk|archive") {
-		t.Errorf("kinds should be validated against its enum, got %q", e.Message)
+func TestBoxViewEnumIsValidated(t *testing.T) {
+	e := firstError(t, `{"action":"messages.list","params":{"box":"spam"}}`)
+	if !strings.Contains(e.Message, "inbox|unread|flagged|sent|drafts|trash|junk") {
+		t.Errorf("box should be validated against its enum, got %q", e.Message)
 	}
 }
 

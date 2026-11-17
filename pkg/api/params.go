@@ -38,22 +38,8 @@ type StateSet struct {
 // Empty reports whether the caller asked for no state change at all.
 func (s StateSet) Empty() bool { return s.Read == nil && s.Flagged == nil }
 
-// MarkSelect is a discriminated union: Mode decides which of the remaining
-// fields are meaningful, and the fields of the other mode are rejected. This
-// replaces the old flat form, where --mailbox together with --all was
-// expressible and had to be rejected at runtime.
-type MarkSelect struct {
-	Mode     string   `json:"mode" req:"1" enum:"mailbox|special" desc:"mailbox: one named mailbox; special: the provider-independent Trash/Junk/Archive across accounts"`
-	Account  string   `json:"account,omitempty" desc:"mode=mailbox: the account that owns the mailbox (required)"`
-	Mailbox  string   `json:"mailbox,omitempty" desc:"mode=mailbox: the mailbox to mark (required)"`
-	Kinds    []string `json:"kinds,omitempty" enum:"trash|junk|archive" desc:"mode=special: which mailboxes to cover (required)"`
-	Accounts []string `json:"accounts,omitempty" desc:"mode=special: limit to these accounts; omit for every account"`
-}
-
 // typeNotes documents constraints that reflection cannot express. They are
 // attached to the matching def in the schema output.
 var typeNotes = map[string]string{
-	"MarkSelect": "mode=mailbox requires account and mailbox and rejects kinds/accounts; " +
-		"mode=special requires kinds and rejects account/mailbox.",
 	"StateSet": "at least one of read/flagged must be present.",
 }

@@ -22,6 +22,9 @@ test:
 # plugin bundles) and ~/.local/bin/ (what PATH and the agent skill call). Building
 # them with two separate commands is how they drift apart silently.
 plugin:
+	# go build refuses to overwrite an existing Mach-O that is not a single object
+	# file, which is exactly what the universal bundle from plugin-universal is.
+	rm -f $(GHOST_BIN)
 	$(GO) build -ldflags='-s -w' -o $(GHOST_BIN) .
 	chmod 755 $(GHOST_BIN)
 	install -m 755 $(GHOST_BIN) $(HOME)/.local/bin/$(BIN)

@@ -7,11 +7,11 @@
 **An [Intelligrit Labs](https://intelligrit.com#labs) Project**
 
 A JSON-driven interface to macOS Mail.app. One request document in, one result
-envelope out — accounts, mailboxes, messages, attachments and drafts, scriptable
-from any language that can spawn a process and write JSON.
+envelope out — accounts, mailboxes, messages, message bodies and drafts,
+scriptable from any language that can spawn a process and write JSON.
 
 ```bash
-mail-app-cli '{"action":"messages.unified","params":{"box":"unread","limit":5,"format":"compact"}}'
+mail-app-cli '{"action":"messages.list","params":{"box":"unread","limit":5,"format":"compact"}}'
 ```
 
 ## Two invariants
@@ -66,7 +66,7 @@ mail-app-cli '{"action":"accounts.list"}'
 mail-app-cli <<'JSON'
 {
   "ops": [
-    {"action": "messages.unified", "params": {"box": "unread", "limit": 10, "format": "compact"}},
+    {"action": "messages.list", "params": {"box": "unread", "limit": 10, "format": "compact"}},
     {"action": "messages.quarantine", "params": {"ids": ["7844"], "dryRun": true}}
   ]
 }
@@ -102,8 +102,7 @@ instead of parsing prose:
 | `UNKNOWN_ACTION` | No such action |
 | `ACCOUNT_NOT_FOUND`, `MAILBOX_NOT_FOUND`, `MESSAGE_MISSING` | The named thing does not exist |
 | `PARTIAL_FAILURE` | The action ran, but not every id was handled — `data` lists which |
-| `HOLDING_BOX_UNAVAILABLE` | The quarantine mailbox is missing and could not be created |
-| `GMAIL_ARCHIVE_UNSUPPORTED` | Mail.app cannot archive Gmail; use `messages.quarantine` |
+| `HOLDING_BOX_UNAVAILABLE` | The quarantine mailbox is missing; create it in Mail.app first |
 | `MOVE_NOT_PERSISTED` | A move was reported as done but the destination never received the messages; see "Moves are verified" |
 | `DRAFT_UNVERIFIED` | The draft was composed but not seen in Drafts; look in Mail.app |
 | `MAIL_SCRIPT_ERROR`, `INTERNAL` | Mail.app or the tool failed |
@@ -133,11 +132,10 @@ it, so there is one place to learn it and one place it can be wrong:
 
 | Object | Fields | Used by |
 |--------|--------|---------|
-| `MailboxRef` | `account`, `mailbox` (both required) | `messages.list`, `messages.patch`, `messages.move`, `messages.archive`, `messages.quarantine`, `open` |
-| `MessageInMailbox` | `id`, `in` (`MailboxRef`) | `messages.show`, `attachments.list`, `attachments.save` |
+| `MailboxRef` | `account`, `mailbox` (both required) | `messages.patch`, `messages.move`, `messages.quarantine` |
+| `MessageInMailbox` | `id`, `in` (`MailboxRef`) | `messages.show` |
 | `Recipients` | `to` (required), `cc`, `bcc` | `draft` |
 | `StateSet` | `read`, `flagged` (at least one) | `messages.patch` |
-| `MarkSelect` | `mode`, then the fields for that mode | `mailboxes.markRead` |
 
 ### Discover the interface at runtime
 
@@ -151,29 +149,30 @@ the same structs the decoder uses, so it cannot drift from the implementation.
 
 ## Actions
 
+There are nine actions, all reported by `schema` at runtime.
+
 ### Read
 
 | Action | Params |
 |--------|--------|
-| `schema` | — |
 | `accounts.list` | `noCache` |
 | `mailboxes.list` | `account`, `counts`, `unreadOnly`, `noCache` |
-| `messages.list` | `account`, `mailbox`, `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
-| `messages.unified` | `box` (`inbox\|unread\|flagged\|sent\|drafts\|trash\|junk`), `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
-| `messages.show` | `message` (`MessageInMailbox`) | `body` (`text\|html\|links`) |
-| `messages.search` | `query`, `account`, `mailbox`, `limit`, `format` |
-| `messages.resolve` | `ids` |
-| `attachments.list` | `message` |
-| `attachments.save` | `message`, `name`, `output` |
+| `messages.list` | `box` **or** `account`+`mailbox`; `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
+| `messages.show` | `message` (`MessageInMailbox`), `body` (`text\|html\|links`) |
 
-`messages.unified` reads across all accounts in one call, and `since` accepts
-`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. `messages.search` matches subject and
-sender only, and it never reads message bodies: reading a body
-(`withContent`, or `messages.show`) is the one call that can block Mail.app's
-entire scripting interface while a download stalls, so a full-text search is not
-offered. See [PERFORMANCE.md](PERFORMANCE.md).
-`messages.resolve` reports where ids currently live and changes nothing, which is
-what the `dryRun` paths use.
+`messages.list` reads either one cross-account view (`box`: `inbox`, `unread`,
+`flagged`, `sent`, `drafts`, `trash`, `junk`) or one named mailbox
+(`account`+`mailbox`). A view resolves the right mailbox name per account, which
+a single account+mailbox pair cannot express; `unread`, `flagged` and `noCache`
+belong to the named-mailbox form, and a view is never cached. `since` accepts
+`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`.
+
+`messages.show` returns the body, thread headers and the attachment list
+(`name`, `fileSize`, `mimeType`). The attachment metadata is read in the same
+JXA round trip as the rest of the message, so it costs nothing extra. Reading a
+body at all (`withContent`, or `messages.show`) is the one call that can block
+Mail.app's entire scripting interface while a download stalls, which is also why
+no full-text search is offered. See [PERFORMANCE.md](PERFORMANCE.md).
 
 ### Write
 
@@ -181,13 +180,14 @@ what the `dryRun` paths use.
 |--------|--------|
 | `messages.patch` | `ids`, `set` (`StateSet`), `in`, `dryRun` |
 | `messages.move` | `ids`, `to`, `in`, `dryRun` |
-| `messages.archive` | `ids`, `in`, `gmailPolicy` (`skip\|read`), `dryRun` |
 | `messages.quarantine` | `ids`, `box`, `in`, `dryRun` |
-| `mailboxes.markRead` | `select` (`MarkSelect`), `unread`, `dryRun` |
 | `draft` | `account`, `from`, `recipients` (`Recipients`), `content`, `dryRun` |
-| `attachments.save` | `message`, `name`, `output` |
-| `sync` | `account` |
-| `open` | `message` (`{in?, id?}`) |
+
+### Tool
+
+| Action | Params |
+|--------|--------|
+| `schema` | — |
 
 Notes that are easy to get wrong:
 
@@ -196,7 +196,7 @@ Notes that are easy to get wrong:
 - **`message.Content` is rendered text**: hyperlinks are flattened to their
   anchor text. Use `body: "html"` when the addresses matter.
 - **A move changes the id.** Mail.app assigns the message a new id in the
-  destination mailbox, so re-list after `move`, `archive` or `quarantine`.
+  destination mailbox, so re-list after `move` or `quarantine`.
 - **`draft` never sends.** It reports the draft's `id` and `verified`. If Mail.app
   has not stored it yet the result says `syncing`, and if it is not found the
   action fails with `DRAFT_UNVERIFIED` rather than claiming success.
@@ -219,7 +219,7 @@ mail-app-cli '{"action":"mailboxes.list","params":{"unreadOnly":true}}' \
 What arrived since a point in time, across every account:
 
 ```bash
-mail-app-cli '{"action":"messages.unified",
+mail-app-cli '{"action":"messages.list",
                "params":{"box":"inbox","since":"2026-10-13","format":"compact"}}' \
   | jq -r '.results[0].data.messages[] | "\(.date[0:10])  \(.from)  —  \(.subject)"'
 ```
@@ -240,8 +240,8 @@ the server has never heard of it, and the message is re-delivered to its origina
 mailbox under a new id. Measured here: a scripted mailbox never received a single
 message, while the same move into the pre-existing `存档` mailbox stuck.
 
-So `messages.move`, `messages.archive` and `messages.quarantine` read the
-destination back and report what they found. Mail.app assigns new ids on a move,
+So `messages.move` and `messages.quarantine` read the destination back and
+report what they found. Mail.app assigns new ids on a move,
 so the check is by the RFC 5322 `Message-ID`, captured before moving:
 
 | Field | Meaning |
@@ -257,10 +257,9 @@ Nothing is rolled back: the messages are where they were.
 Two consequences worth knowing:
 
 - **Create the destination in Mail.app, not through this tool.** A mailbox made
-  in Mail.app is registered on the server and receives mail normally.
-- `messages.archive` looks for the account's archive mailbox by name
-  (`Archive`, `存档`, `归档`, ...) because Mail.app exposes no unified archive
-  accessor and the name is localized.
+  in Mail.app is registered on the server and receives mail normally. That
+  includes an archive mailbox: resolve its localized name with
+  `mailboxes.list` and pass it as `to`.
 
 ### Getting real hyperlinks out of a message
 
@@ -307,13 +306,6 @@ mail-app-cli '{"action":"messages.patch",
                          "in":{"account":"Exchange","mailbox":"收件箱"}}}'
 ```
 
-Mark the things nobody reads anyway, without moving anything:
-
-```bash
-mail-app-cli '{"action":"mailboxes.markRead",
-               "params":{"select":{"mode":"special","kinds":["trash","junk"]},"dryRun":true}}'
-```
-
 Compose a draft for a human to send (the body needs no shell escaping):
 
 ```bash
@@ -330,14 +322,6 @@ mail-app-cli <<'JSON'
   }
 }
 JSON
-```
-
-Hand a message to the user in Mail.app:
-
-```bash
-mail-app-cli '{"action":"open",
-               "params":{"message":{"id":"7847",
-                                    "in":{"account":"Google","mailbox":"All Mail"}}}}'
 ```
 
 ## Agent skill
@@ -378,8 +362,8 @@ pkg/mail/            the Mail.app engine (AppleScript / JXA)
 pkg/cache/           the small on-disk cache
 ```
 
-`go test ./...` covers request decoding, nested and union validation, the schema
-and the dry-run paths. Anything that would need a real mailbox is exercised
+`go test ./...` covers request decoding, nested validation, the schema and the
+dry-run paths. Anything that would need a real mailbox is exercised
 manually instead.
 
 ## JSON envelope reference

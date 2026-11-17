@@ -24,13 +24,9 @@ const (
 	// CodeHoldingBoxMissing means the quarantine holding mailbox is absent and
 	// could not be created. The action is retryable; nothing was changed.
 	CodeHoldingBoxMissing = "HOLDING_BOX_UNAVAILABLE"
-	// CodeGmailArchive means the account is Gmail, where Mail.app offers no
-	// safe scriptable archive. Use messages.quarantine instead.
-	CodeGmailArchive = "GMAIL_ARCHIVE_UNSUPPORTED"
 	// CodeDraftUnverified means the draft was composed but not observed in the
 	// Drafts mailbox. Look in Mail.app; do not retry blindly.
 	CodeDraftUnverified = "DRAFT_UNVERIFIED"
-	CodeAttachmentMiss  = "ATTACHMENT_NOT_FOUND"
 	// CodePartialFailure means the action ran but not every id was handled. The
 	// data field still carries the per-id outcome.
 	CodePartialFailure = "PARTIAL_FAILURE"

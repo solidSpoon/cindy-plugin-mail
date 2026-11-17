@@ -1,6 +1,6 @@
 ---
 name: mail-app-cli
-description: Read and organize the user's real macOS Mail.app mailbox through the mail-app-cli JSON tool — accounts, mailboxes, unread mail, message bodies, attachments, search, read/flag state, archive, quarantine (never delete) and drafts (never send). Use when the user asks about their email, inbox, unread messages, a specific message or attachment, or wants a reply drafted for them to approve.
+description: Read and organize the user's real macOS Mail.app mailbox through the mail-app-cli JSON tool — accounts, mailboxes, message lists, message bodies with their attachment lists, read/flag state, moves, quarantine (never delete) and drafts (never send). Use when the user asks about their email, unread messages, a specific message or its attachments, or wants a reply drafted for them to approve.
 compatibility: macOS with Mail.app configured; needs the mail-app-cli binary on PATH and Automation permission for Mail.app.
 ---
 
@@ -9,7 +9,7 @@ compatibility: macOS with Mail.app configured; needs the mail-app-cli binary on 
 JSON in, JSON out. One binary, no dependencies, **no flag interface**. Every request is one document:
 
 ```bash
-mail-app-cli '{"action":"messages.unified","params":{"box":"unread","limit":20,"format":"compact"}}'
+mail-app-cli '{"action":"messages.list","params":{"box":"unread","limit":20,"format":"compact"}}'
 ```
 
 ## Install
@@ -58,14 +58,14 @@ This matters because unknown parameters are **rejected, never ignored**, at any 
 
 - Envelope: `{"ok", "okCount", "failed", "results":[...]}`; each result has `ok`, `dryRun`, `data`, `error{code,hint}`.
 - **Exit code** is `0` when every operation succeeded, `1` otherwise — the JSON is printed either way.
-- Branch on `error.code`, not on prose: `MESSAGE_MISSING`, `MAILBOX_NOT_FOUND`, `ACCOUNT_NOT_FOUND`, `PARTIAL_FAILURE` (data still lists what worked), `HOLDING_BOX_UNAVAILABLE`, `MOVE_NOT_PERSISTED`, `GMAIL_ARCHIVE_UNSUPPORTED`, `DRAFT_UNVERIFIED`, `INVALID_REQUEST`, `UNKNOWN_ACTION`.
+- Branch on `error.code`, not on prose: `MESSAGE_MISSING`, `MAILBOX_NOT_FOUND`, `ACCOUNT_NOT_FOUND`, `PARTIAL_FAILURE` (data still lists what worked), `HOLDING_BOX_UNAVAILABLE`, `MOVE_NOT_PERSISTED`, `DRAFT_UNVERIFIED`, `INVALID_REQUEST`, `UNKNOWN_ACTION`.
 - Add `"pretty": true` (next to `"action"`) only when a human will read it; the default single line is about half the bytes.
 - `"format": "compact"` on reads returns 8 fields per message instead of 16 — use it for anything you will scan.
 
 ## Working order
 
 1. `mailboxes.list` with `unreadOnly: true` — cheapest overview, also reports `unreadTotal`.
-2. `messages.unified` (`box: inbox|unread|flagged|sent|drafts|trash|junk`) with `since` + `format: compact` — one call covers every account.
+2. `messages.list` with `box: inbox|unread|flagged|sent|drafts|trash|junk` and `since` + `format: compact` — one call covers every account. Use `account`+`mailbox` instead to read one named mailbox.
 3. `messages.show` only for the messages that matter: bodies are the expensive read.
 4. `dryRun` the changes → tell the user → apply.
 
@@ -75,15 +75,13 @@ This matters because unknown parameters are **rejected, never ignored**, at any 
 |--------|----------|----------|
 | `accounts.list` | — | `noCache` |
 | `mailboxes.list` | — | `account`, `counts`, `unreadOnly`, `noCache` |
-| `messages.list` | `account`, `mailbox` | `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
-| `messages.unified` | `box` | `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
+| `messages.list` (view) | `box` | `since`, `limit`, `offset`, `withContent`, `withHeaders`, `format` |
+| `messages.list` (mailbox) | `account`, `mailbox` | `unread`, `flagged`, `since`, `limit`, `offset`, `withContent`, `withHeaders`, `noCache`, `format` |
 | `messages.show` | `message` | `body` (`text\|html\|links`) |
-| `messages.search` | `query` | `account`, `mailbox`, `limit`, `format` |
-| `messages.resolve` | `ids` | — |
-| `attachments.list` | `message` | — |
-| `attachments.save` | `message`, `name` | `output` |
 
-`since` is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. `messages.search` matches subject and sender only, and never reads bodies — reading a body at all (`withContent`, `messages.show`) is the call that can block Mail.app, which is why a full-text search is not offered. `messages.resolve` reports where ids live and changes nothing.
+The two `messages.list` forms are alternatives: `box` reads a cross-account view (it resolves the right mailbox name per account), `account`+`mailbox` reads any one mailbox. `unread`, `flagged` and `noCache` apply only to the named-mailbox form; a view already filters and is never cached. **Never send both forms.**
+
+`since` is `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. `messages.show` returns the body, thread headers and the attachment list (`name`, `fileSize`, `mimeType`). Reading a body at all (`withContent`, `messages.show`) is the call that can block Mail.app, which is why a full-text search is not offered. Attachments can be listed but **not saved to disk** by this tool — send the user to Mail.app for that.
 
 ## Write actions
 
@@ -91,19 +89,14 @@ This matters because unknown parameters are **rejected, never ignored**, at any 
 |--------|----------|----------|
 | `messages.patch` | `ids`, `set` | `in`, `dryRun` |
 | `messages.move` | `ids`, `to` | `in`, `dryRun` |
-| `messages.archive` | `ids` | `in`, `gmailPolicy`, `dryRun` |
 | `messages.quarantine` | `ids` | `box`, `in`, `dryRun` |
-| `mailboxes.markRead` | `select` | `unread`, `dryRun` |
 | `draft` | `recipients`, `content` | `account`, `from`, `dryRun` |
-| `sync` | — | `account` |
-| `open` | — | `message` |
 
 Shared objects (see `schema` → `defs`) — learn these once:
 
 - `in` is `{"account":"…","mailbox":"…"}` (both required). **Omit it to resolve ids globally**; Mail.app ids are unique database-wide, so one call can mix accounts.
 - `message` is `{"id":"…","in":{…}}`.
 - `set` is `{"read":true,"flagged":true}` — a field left out is left untouched; it replaces the old separate mark and flag calls.
-- `select` is a union: `{"mode":"mailbox","account":…,"mailbox":…}` **or** `{"mode":"special","kinds":["trash","junk","archive"],"accounts":[…]}`. Mixing the two modes is a decode error.
 - `content` is `{"subject":…,"body":…,"attach":[…]}`; `recipients` is `{"to":[…],"cc":[…],"bcc":[…]}`.
 
 ## Recipes
@@ -114,15 +107,18 @@ mail-app-cli '{"action":"mailboxes.list","params":{"unreadOnly":true,"noCache":t
   | jq -r '.results[0].data.mailboxes[] | "\(.Account)/\(.Name): \(.UnreadCount)"'
 
 # what arrived since a point in time, every account at once
-mail-app-cli '{"action":"messages.unified","params":{"box":"inbox","since":"2026-10-13","format":"compact"}}' \
+mail-app-cli '{"action":"messages.list","params":{"box":"inbox","since":"2026-10-13","format":"compact"}}' \
   | jq -r '.results[0].data.messages[] | "\(.date[0:10])  \(.from)  —  \(.subject)"'
 
-# one message in full
+# unread in one named mailbox
+mail-app-cli '{"action":"messages.list","params":{"account":"Exchange","mailbox":"收件箱","unread":true,"format":"compact"}}'
+
+# one message in full, with its attachment list
 mail-app-cli '{"action":"messages.show","params":{"message":{"id":"7847","in":{"account":"Google","mailbox":"All Mail"}}}}'
 
 # real hyperlink addresses + the sender's own unsubscribe route
 # (the default body is Mail.app's rendered text, in which URLs are flattened
-#  to anchor text, so `body` is what recovers them)
+#  to anchor text, so `body: "links"` is what recovers them)
 mail-app-cli '{"action":"messages.show","params":{
   "message":{"id":"7811","in":{"account":"Google","mailbox":"Spam"}},
   "body":"links"}}' \
@@ -135,18 +131,12 @@ mail-app-cli '{"action":"messages.quarantine","params":{"ids":["7844","7846"]}}'
 # read + flagged in one call
 mail-app-cli '{"action":"messages.patch","params":{"ids":["7847"],"set":{"read":true,"flagged":true}}}'
 
-# clear the mailboxes nobody reads
-mail-app-cli '{"action":"mailboxes.markRead","params":{"select":{"mode":"special","kinds":["trash","junk"]},"dryRun":true}}'
-
 # draft a reply for the user to send (the body needs no shell escaping)
 mail-app-cli <<'JSON'
 {"action":"draft","params":{"account":"Google",
  "recipients":{"to":["someone@example.com"]},
  "content":{"subject":"Re: 会议","body":"第一行\n第二行带 \"引号\""}}}
 JSON
-
-# hand a message to the user in Mail.app
-mail-app-cli '{"action":"open","params":{"message":{"id":"7847","in":{"account":"Google","mailbox":"All Mail"}}}}'
 ```
 
 Batch several operations (one process, and one failure does not stop the rest):
@@ -154,7 +144,7 @@ Batch several operations (one process, and one failure does not stop the rest):
 ```bash
 mail-app-cli <<'JSON'
 {"ops":[
-  {"action":"messages.unified","params":{"box":"unread","limit":10,"format":"compact"}},
+  {"action":"messages.list","params":{"box":"unread","limit":10,"format":"compact"}},
   {"action":"messages.quarantine","params":{"ids":["7844"],"dryRun":true}}
 ]}
 JSON
@@ -166,19 +156,20 @@ JSON
 |---------|-----------------|
 | Parameters next to `"action"` | They go inside `"params"`; a stray field is refused with a hint |
 | Reading ids as numbers | Ids are **strings** in JSON (`"7847"`) |
-| Acting on an id after a move | `move`/`archive`/`quarantine` give the message a **new id** — re-list the destination |
+| Acting on an id after a move | `move`/`quarantine` give the message a **new id** — re-list the destination |
 | Expecting `draft` to send | It cannot. It reports `verified`, or `syncing` when Mail.app has not stored it yet; not found → `DRAFT_UNVERIFIED` |
 | Trying to move a draft out of Drafts | Mail.app puts it straight back under a new id. Only the user can remove drafts, in Mail.app |
 | Using Trash as a holding area | Mail.app empties each account's Trash on its own schedule. Quarantine instead |
 | Creating the holding mailbox with this tool | A scripted mailbox is **local-only**: the server re-delivers anything moved into it under a new id, and the tool no longer creates mailboxes at all. Ask the user to create it in Mail.app (that registers it server-side), then quarantine into it |
-| Trusting `changed: N` from a move | It is not evidence. `messages.move/archive/quarantine` read the destination back and report `confirmed` / `notPersisted`; a non-empty `notPersisted` means `MOVE_NOT_PERSISTED` and nothing moved. The check is by RFC `Message-ID`, because ids change on every move |
+| Trusting `changed: N` from a move | It is not evidence. `messages.move`/`messages.quarantine` read the destination back and report `confirmed` / `notPersisted`; a non-empty `notPersisted` means `MOVE_NOT_PERSISTED` and nothing moved. The check is by RFC `Message-ID`, because ids change on every move |
 | Assuming English mailbox names | This machine is localized: `收件箱`, `草稿`, `垃圾邮件`, `已删除邮件`, `小道通讯`; Google stays English (`INBOX`, `Drafts`, `Spam`, `Trash`, `All Mail`, `Important`) |
-| Expecting fresh counts from cache | `accounts`/`mailboxes` cache 60s, message lists 5 min. Pass `noCache: true` when freshness matters |
+| Expecting fresh counts from cache | `accounts`/`mailboxes` cache 60s, message lists 5 min. Pass `noCache: true` when freshness matters (named-mailbox form only) |
 | `withContent` on a big or spam mailbox | It can block Mail.app's whole scripting interface until a body downloads |
-| Searching for body text | `messages.search` never reads bodies, which is why it is cheap; a full-text search is not available. Reading a body at all (`withContent`, `messages.show`) is the risky call |
+| Searching for body text | There is no full-text search: it would mean reading every body, and reading a body is the risky call. Narrow with `box` + `since` instead, or ask the user to search in Mail.app |
 | Reporting "there is no unsubscribe link" | The default body is Mail.app's *rendered* text, where every URL has been flattened to anchor text. Use `body: "html"` or `"links"` to get `links` (real hrefs) and `listUnsubscribe` (RFC 2369/8058, the sender's own route — often present when the body has no anchor at all) |
+| Promising to save an attachment | The tool only lists attachment metadata; it has no save-to-disk action. Tell the user to save it in Mail.app |
 
-Accounts on this machine: `Exchange`, `iCloud`, `Google`.
+Accounts on this machine: `Exchange`, `QQ`, `Google`.
 
 ## Notes
 

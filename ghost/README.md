@@ -35,5 +35,6 @@ chmod 755 ghost/bin/mail-app-cli
 - 不声明网络、凭证或设置页：插件零配置，一切走本机 Mail.app。
 - 操作目录来自二进制的 `schema` action（实时读取，不硬编码）；二进制缺失时
   `list_tools` 会降级成静态列表并给出 warning。
-- 危险写操作（move / archive / quarantine / 多封 patch / markRead）会经 `confirm`
-  请用户点一次同意。
+- 危险写操作（move / archive / quarantine / 多封 patch / markRead）不弹确认框：
+  `dryRun:true` 只预演，非 dryRun 直接执行。这些都是可逆操作（quarantine 只是
+  移到用户自己的持有邮箱），回执里的 `confirmed` / `notPersisted` 才是证据。

@@ -188,10 +188,18 @@ func projectMessages(messages []mail.Message, format string) any {
 	return out
 }
 
+// MessagesListParams reads either one named mailbox or one cross-account view.
+//
+// The two forms are a single action because they share everything else: the
+// filters, pagination, projection and body reading are identical. They cannot be
+// a single addressable target, though: a view resolves the right mailbox name
+// per account (收件箱 vs INBOX vs All Mail), which no account+mailbox pair can
+// express.
 type MessagesListParams struct {
-	Account     string `json:"account" req:"1" desc:"account name, e.g. \"Exchange\""`
-	Mailbox     string `json:"mailbox" req:"1" desc:"mailbox name inside that account, e.g. \"收件箱\""`
-	Unread      bool   `json:"unread,omitempty" desc:"only unread messages"`
+	Box         string `json:"box,omitempty" enum:"inbox|unread|flagged|sent|drafts|trash|junk" desc:"read one cross-account view across every account; mutually exclusive with account and mailbox"`
+	Account     string `json:"account,omitempty" desc:"account name, e.g. \"Exchange\"; required together with mailbox unless box is given"`
+	Mailbox     string `json:"mailbox,omitempty" desc:"mailbox name inside that account, e.g. \"收件箱\"; required together with account unless box is given"`
+	Unread      bool   `json:"unread,omitempty" desc:"only unread messages (account+mailbox form only)"`
 	Flagged     bool   `json:"flagged,omitempty" desc:"only flagged messages"`
 	Since       string `json:"since,omitempty" desc:"only messages received at or after this date: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"`
 	Limit       int    `json:"limit,omitempty" def:"25" desc:"maximum messages to return"`
@@ -203,9 +211,32 @@ type MessagesListParams struct {
 }
 
 func init() {
-	Register("messages.list", "List messages in one mailbox", func(req MessagesListParams) (any, error) {
+	Register("messages.list", "List messages in one mailbox, or one cross-account view with box", func(req MessagesListParams) (any, error) {
 		if req.Limit <= 0 {
 			req.Limit = 25
+		}
+		if req.Box != "" {
+			if req.Account != "" || req.Mailbox != "" {
+				return nil, errf(CodeInvalidRequest,
+					"messages.list: box cannot be combined with account or mailbox")
+			}
+			if req.Unread || req.Flagged || req.NoCache {
+				return nil, errf(CodeInvalidRequest,
+					"messages.list: unread, flagged and noCache apply to account+mailbox only; a box view already filters and is never cached")
+			}
+			messages, err := mail.NewClient().GetUnifiedMessagesJSON(req.Box, req.Limit, req.Offset,
+				req.WithContent, req.WithHeaders, req.Since)
+			if err != nil {
+				return nil, errf(CodeScriptFailed, "failed to read the %s view: %v", req.Box, err)
+			}
+			return map[string]any{
+				"box": req.Box, "count": len(messages), "cached": false,
+				"messages": projectMessages(messages, req.Format),
+			}, nil
+		}
+		if req.Account == "" || req.Mailbox == "" {
+			return nil, errf(CodeInvalidRequest,
+				"messages.list: give box, or both account and mailbox")
 		}
 		cacheKey := fmt.Sprintf("msgs-%s-%s-%d-%d-%v-%v-%s-%v-%v",
 			sanitizeCacheKey(req.Account), sanitizeCacheKey(req.Mailbox),
@@ -292,119 +323,5 @@ func init() {
 		data["listUnsubscribe"] = parsed.ListUnsubscribe
 		data["listUnsubscribeOneClick"] = parsed.ListUnsubscribeOneClick
 		return data, nil
-	})
-}
-
-type MessagesUnifiedParams struct {
-	Box         string `json:"box" req:"1" enum:"inbox|unread|flagged|sent|drafts|trash|junk" desc:"which cross-account view to read"`
-	Since       string `json:"since,omitempty" desc:"only messages received at or after this date: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"`
-	Limit       int    `json:"limit,omitempty" def:"25" desc:"maximum messages to return"`
-	Offset      int    `json:"offset,omitempty" desc:"messages to skip (pagination)"`
-	WithContent bool   `json:"withContent,omitempty" desc:"include bodies"`
-	WithHeaders bool   `json:"withHeaders,omitempty" desc:"include InReplyTo/References for threading (about 9x slower)"`
-	Format      string `json:"format,omitempty" enum:"full|compact" def:"full" desc:"compact drops fields that are empty for the query"`
-}
-
-func init() {
-	Register("messages.unified", "Read one cross-account view (inbox, unread, flagged, sent, drafts, trash, junk)", func(req MessagesUnifiedParams) (any, error) {
-		if req.Limit <= 0 {
-			req.Limit = 25
-		}
-		messages, err := mail.NewClient().GetUnifiedMessagesJSON(req.Box, req.Limit, req.Offset,
-			req.WithContent, req.WithHeaders, req.Since)
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to read the %s view: %v", req.Box, err)
-		}
-		return map[string]any{
-			"box": req.Box, "count": len(messages),
-			"messages": projectMessages(messages, req.Format),
-		}, nil
-	})
-}
-
-type MessagesSearchParams struct {
-	Query   string `json:"query" req:"1" desc:"matched against subject and sender; bodies are not searched"`
-	Account string `json:"account,omitempty" desc:"limit to one account"`
-	Mailbox string `json:"mailbox,omitempty" desc:"limit to one mailbox; requires account"`
-	Limit   int    `json:"limit,omitempty" def:"50" desc:"maximum results"`
-	Format  string `json:"format,omitempty" enum:"full|compact" def:"full" desc:"compact drops fields that are empty for the query"`
-}
-
-func init() {
-	Register("messages.search", "Search subject and sender across mailboxes", func(req MessagesSearchParams) (any, error) {
-		if req.Limit <= 0 {
-			req.Limit = 50
-		}
-		if req.Mailbox != "" && req.Account == "" {
-			return nil, errf(CodeInvalidRequest, "messages.search: mailbox requires account")
-		}
-		messages, err := mail.NewClient().SearchMessagesJSON(req.Query, req.Account, req.Mailbox, req.Limit)
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "search failed: %v", err)
-		}
-		return map[string]any{
-			"query": req.Query, "count": len(messages),
-			"messages": projectMessages(messages, req.Format),
-		}, nil
-	})
-}
-
-type MessagesResolveParams struct {
-	IDs []string `json:"ids" req:"1" desc:"Mail.app message ids to locate"`
-}
-
-func init() {
-	Register("messages.resolve", "Report where message ids currently live, changing nothing", func(req MessagesResolveParams) (any, error) {
-		locations, err := mail.NewClient().ResolveMessages(req.IDs)
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
-		}
-		missing := []string{}
-		for _, loc := range locations {
-			if !loc.Exists {
-				missing = append(missing, loc.ID)
-			}
-		}
-		return map[string]any{
-			"locations": locations, "count": len(locations), "missing": missing,
-		}, nil
-	})
-}
-
-// ------------------------------------------------------------ attachments
-
-type AttachmentsListParams struct {
-	Message MessageInMailbox `json:"message" req:"1" desc:"the message that carries the attachments"`
-}
-
-func init() {
-	Register("attachments.list", "List the attachments of one message", func(req AttachmentsListParams) (any, error) {
-		in := req.Message.In
-		attachments, err := mail.NewClient().GetAttachmentsJSON(in.Account, in.Mailbox, req.Message.ID)
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to list attachments: %v", err)
-		}
-		return map[string]any{"attachments": attachments, "count": len(attachments)}, nil
-	})
-}
-
-type AttachmentsSaveParams struct {
-	Message MessageInMailbox `json:"message" req:"1"`
-	Name    string           `json:"name" req:"1" desc:"attachment file name as reported by attachments.list"`
-	Output  string           `json:"output,omitempty" desc:"destination path; defaults to the attachment name in the working directory"`
-}
-
-func init() {
-	Register("attachments.save", "Save one attachment to disk", func(req AttachmentsSaveParams) (any, error) {
-		in := req.Message.In
-		output := req.Output
-		if output == "" {
-			output = req.Name
-		}
-		if err := mail.NewClient().SaveAttachment(in.Account, in.Mailbox, req.Message.ID, req.Name, output); err != nil {
-			return nil, errf(CodeScriptFailed, "failed to save attachment %q: %v", req.Name, err).
-				withHint("confirm the name with attachments.list")
-		}
-		return map[string]any{"saved": output, "name": req.Name, "id": req.Message.ID}, nil
 	})
 }

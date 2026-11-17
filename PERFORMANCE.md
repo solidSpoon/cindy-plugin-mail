@@ -21,10 +21,10 @@ and Mail.app answers them serially. Measured costs:
 ## How the CLI uses this
 
 - **Message lookup by ID** uses `byId()`. IDs are unique across the whole Mail
-  database, so no enumeration is needed; `messages.show`, `messages.mark`, `messages.flag`, `messages.quarantine`,
-  `messages.archive`, `messages.move` and the attachment actions run in ~0.3 s
-  regardless of mailbox size.
-- **Batch mutations** (`messages.mark` with several ids) run in one `osascript`
+  database, so no enumeration is needed; `messages.show`, `messages.patch`,
+  `messages.quarantine` and `messages.move` run in ~0.3 s regardless of mailbox
+  size.
+- **Batch mutations** (`messages.patch` with several ids) run in one `osascript`
   process: cost is one launch plus ~10 ms per message.
 - **`messages.list`** is hybrid. Filters (`unread`, `flagged`, `since`)
   always use one bulk read per property. Then:
@@ -35,9 +35,6 @@ and Mail.app answers them serially. Measured costs:
 - **`mailboxes.list`** bulk-reads names and unread counts. `TotalCount` is only
   filled with `counts: true` because it needs a `messages.length` per mailbox
   (~3 s across 80 mailboxes vs ~0.7 s without).
-- **`mailboxes.markRead`** uses `whose({readStatus: false})` and loops over the
-  result; bulk assignment on a `whose()` specifier is not supported. It skips
-  mailboxes whose `unreadCount` is already 0.
 - Special mailboxes come from Mail's unified `trashMailbox`/`junkMailbox`/...
   properties (`.mailboxes()` gives the per-account boxes), so provider naming
   never matters.
@@ -78,10 +75,9 @@ Mail.app start, body not downloaded, remote content to resolve). Treat the
 mitigations as applying to that case. Reproducing it deliberately means quitting
 and relaunching Mail.app first.
 
-Also worth stating explicitly: `messages.search` never reads bodies. The search
-implementation lowercases `subject()` and `sender()` and matches on those, so
-"full-text search would hang" is an inference about reading every body in turn —
-not something search does today.
+There is no full-text search for the same reason: it would mean reading every
+body in turn, and reading a body is the risky call described above. Search by
+narrowing with `box` + `since`, or let the user search in Mail.app.
 
 ### `source()` is the cheap way to the real URLs
 
@@ -120,13 +116,9 @@ Consequences baked into the tool:
 - `messages.quarantine` does not create the holding mailbox any more (it used to,
   which is how two empty local mailboxes ended up in the account). It fails with
   `HOLDING_BOX_UNAVAILABLE`, and the mailbox has to be created in Mail.app.
-- `messages.move`, `messages.archive` and `messages.quarantine` read the
-  destination back and report `confirmed` / `notPersisted`, tracked by RFC
+- `messages.move` and `messages.quarantine` read the destination back and report `confirmed` / `notPersisted`, tracked by RFC
   `Message-ID` because Mail.app assigns new ids on a move. Before this, 250
   messages were reported as changed while every one of them bounced back.
-- `messages.archive` resolves the archive mailbox by name per account
-  (`Archive`, `存档`, ...); it used to hard-code `Archive`, which never matches on
-  a localized account.
 
 A failed move is reported immediately: the message never appears in the
 destination, so no sync round-trip is needed to detect it.

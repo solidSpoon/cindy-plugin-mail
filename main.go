@@ -17,7 +17,7 @@ import (
 	"github.com/intelligrit/mail-app-cli/pkg/api"
 )
 
-const version = "2.0.1"
+const version = "3.0.0"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout))
@@ -85,7 +85,7 @@ func helpDoc() any {
 		"version": version,
 		"usage": []string{
 			`mail-app-cli '{"action":"schema"}'`,
-			`mail-app-cli '{"action":"messages.unified","params":{"box":"unread","limit":10,"format":"compact"}}'`,
+			`mail-app-cli '{"action":"messages.list","params":{"box":"unread","limit":10,"format":"compact"}}'`,
 			`printf '%s' '{"ops":[...]}' | mail-app-cli`,
 		},
 		"input":       "one JSON request document, as the first argument or on stdin; an action plus its own params object, or an ops array of them",

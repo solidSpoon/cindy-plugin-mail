@@ -107,6 +107,9 @@ type Message struct {
 	BccRecipients []string
 	InReplyTo     string   `json:",omitempty"`
 	References    []string `json:",omitempty"`
+	// Attachments is read in the same JXA round trip as the rest of the
+	// message, so showing a message costs the same with or without attachments.
+	Attachments []Attachment `json:",omitempty"`
 }
 
 // Attachment represents an email attachment
@@ -154,50 +157,7 @@ function resolveMessage(mbox, id) {
 	const m = mbox.messages.byId(n);
 	try { m.id(); return m; } catch (e) { return null; }
 }
-// ensureMailbox returns the mailbox called name inside the account,
-// creating it at the account's top level when it does not exist yet. Used by
-// messages quarantine, which parks messages in a dedicated holding mailbox.
-// Several creation spellings are attempted because Mail.app's scripting
-// support for mailbox creation differs between release trains.
-function ensureMailbox(acc, name) {
-	let mb = resolveMailbox(acc, name);
-	if (mb) return mb;
-	try {
-		mail.make({ new: 'mailbox', at: acc.mailboxes, withProperties: { name: name } });
-	} catch (e) {
-		try {
-			acc.mailboxes.push(mail.Mailbox({ name: name }));
-		} catch (e2) {
-			try {
-				mail.make({ new: 'mailbox', at: acc, withProperties: { name: name } });
-			} catch (e3) {}
-		}
-	}
-	return resolveMailbox(acc, name);
-}
 `
-
-// jsArchiveBox resolves an account's archive mailbox by any of the names it
-// goes by. Generated from archiveCandidates so the scripting layer and
-// ArchiveMailboxName cannot disagree.
-var jsArchiveBox = `
-function archiveBox(acc) {
-	const candidates = ` + jsStringArray(archiveCandidates) + `;
-	for (const name of candidates) {
-		try { const box = resolveMailbox(acc, name); if (box) return box; } catch (e) {}
-	}
-	return null;
-}
-`
-
-// jsStringArray renders a Go slice as a JavaScript array literal.
-func jsStringArray(values []string) string {
-	parts := make([]string, 0, len(values))
-	for _, v := range values {
-		parts = append(parts, "'"+escapeJSString(v)+"'")
-	}
-	return "[" + strings.Join(parts, ", ") + "]"
-}
 
 // jsParseThreadHeaders extracts In-Reply-To and References from a raw
 // "all headers" string. Both headers can fold across lines (RFC 5322
@@ -511,99 +471,6 @@ JSON.stringify(result);
 	return accounts, nil
 }
 
-// SyncAccount forces Mail.app to check for new mail (syncs all accounts)
-// Note: Mail.app's AppleScript doesn't support per-account sync, so this syncs all accounts
-func (c *Client) SyncAccount(accountName string) error {
-	// Verify account exists
-	script := fmt.Sprintf(`
-	tell application "Mail"
-		set accountFound to false
-		repeat with acc in accounts
-			if name of acc is "%s" then
-				set accountFound to true
-				exit repeat
-			end if
-		end repeat
-		if not accountFound then
-			error "Account not found: %s"
-		end if
-	end tell
-`, escapeAppleScriptString(accountName), escapeAppleScriptString(accountName))
-
-	_, err := c.runAppleScript(script)
-	if err != nil {
-		return err
-	}
-
-	// Check for new mail (syncs all accounts)
-	return c.SyncAllAccounts()
-}
-
-// SyncAllAccounts forces Mail.app to check for new mail across all accounts
-func (c *Client) SyncAllAccounts() error {
-	script := `tell application "Mail" to check for new mail`
-	_, err := c.runAppleScript(script)
-	return err
-}
-
-// OpenInMail opens and activates Mail.app, optionally focusing an account, mailbox, or message
-func (c *Client) OpenInMail(accountName, mailboxName, messageID string) error {
-	var script string
-
-	if messageID != "" && accountName != "" && mailboxName != "" {
-		script = fmt.Sprintf(`
-		tell application "Mail"
-			activate
-			try
-				set targetAccount to account "%s"
-				set targetMailbox to mailbox "%s" of targetAccount
-				set msgs to messages of targetMailbox
-				repeat with msg in msgs
-					if id of msg as string is "%s" then
-						set selected messages of message viewer 1 to {msg}
-						open msg
-						exit repeat
-					end if
-				end repeat
-			end try
-		end tell`,
-			escapeAppleScriptString(accountName),
-			escapeAppleScriptString(mailboxName),
-			escapeAppleScriptString(messageID),
-		)
-	} else if accountName != "" && mailboxName != "" {
-		script = fmt.Sprintf(`
-		tell application "Mail"
-			activate
-			try
-				set targetAccount to account "%s"
-				set targetMailbox to mailbox "%s" of targetAccount
-				set selected mailboxes of message viewer 1 to {targetMailbox}
-			end try
-		end tell`,
-			escapeAppleScriptString(accountName),
-			escapeAppleScriptString(mailboxName),
-		)
-	} else if accountName != "" {
-		script = fmt.Sprintf(`
-		tell application "Mail"
-			activate
-			try
-				set targetAccount to account "%s"
-				set targetMailbox to mailbox "INBOX" of targetAccount
-				set selected mailboxes of message viewer 1 to {targetMailbox}
-			end try
-		end tell`,
-			escapeAppleScriptString(accountName),
-		)
-	} else {
-		script = `tell application "Mail" to activate`
-	}
-
-	_, err := c.runAppleScript(script)
-	return err
-}
-
 // GetMailboxesJSON retrieves mailboxes as JSON using JXA. withCounts also
 // fills TotalCount, which costs a full enumeration per mailbox (~200ms on
 // large ones).
@@ -888,6 +755,14 @@ try {
 
 		const threadHeaders = parseThreadHeaders(msg.allHeaders() || '');
 
+		const attachments = [];
+		const atts = msg.mailAttachments();
+		for (let a = 0; a < atts.length; a++) {
+			let mimeType = 'unknown';
+			try { mimeType = atts[a].mimeType() || 'unknown'; } catch (e) {}
+			attachments.push({ name: atts[a].name(), fileSize: atts[a].fileSize(), mimeType: mimeType });
+		}
+
 		result = {
 			id: String(msg.id()),
 			messageId: msg.messageId() || '',
@@ -905,7 +780,8 @@ try {
 			ccRecipients: ccRecipients,
 			bccRecipients: bccRecipients,
 			inReplyTo: threadHeaders.inReplyTo,
-			references: threadHeaders.references
+			references: threadHeaders.references,
+			attachments: attachments
 		};
 	}
 } catch (e) {
@@ -958,250 +834,6 @@ JSON.stringify(result);
 		return "", fmt.Errorf("unexpected output: %w", err)
 	}
 	return source, nil
-}
-
-// GetAttachmentsJSON retrieves attachments from a message
-func (c *Client) GetAttachmentsJSON(accountName, mailboxName, messageID string) ([]Attachment, error) {
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-const result = [];
-`+jsResolveMailbox+`
-try {
-	const acc = mail.accounts.byName('%s');
-	const mbox = resolveMailbox(acc, '%s');
-	if (!mbox) throw 'Mailbox not found';
-	const target = resolveMessage(mbox, '%s');
-	if (target) {
-		const attachments = target.mailAttachments();
-		for (let a = 0; a < attachments.length; a++) {
-			const att = attachments[a];
-			let mimeType = 'unknown';
-			try {
-				mimeType = att.mimeType() || 'unknown';
-			} catch (e) {
-				// mimeType() sometimes fails in Mail.app
-			}
-			result.push({
-				name: att.name(),
-				fileSize: att.fileSize(),
-				mimeType: mimeType
-			});
-		}
-	}
-} catch (e) {
-	// Handle errors gracefully
-}
-
-JSON.stringify(result);
-`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID))
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return nil, err
-	}
-
-	var attachments []Attachment
-	if err := json.Unmarshal([]byte(output), &attachments); err != nil {
-		return nil, fmt.Errorf("failed to parse attachments JSON: %w", err)
-	}
-
-	return attachments, nil
-}
-
-// SaveAttachment saves an attachment to disk
-func (c *Client) SaveAttachment(accountName, mailboxName, messageID, attachmentName, savePath string) error {
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-const app = Application.currentApplication();
-app.includeStandardAdditions = true;
-`+jsResolveMailbox+`
-try {
-	const acc = mail.accounts.byName('%s');
-	const mbox = resolveMailbox(acc, '%s');
-	if (!mbox) throw 'Mailbox not found';
-	const target = resolveMessage(mbox, '%s');
-	if (!target) {
-		'Error: Message not found';
-	} else {
-		const attachments = target.mailAttachments();
-		let found = false;
-		for (let a = 0; a < attachments.length; a++) {
-			if (attachments[a].name() === '%s') {
-				const pathObj = Path('%s');
-				attachments[a].save({ in: pathObj });
-				found = true;
-				break;
-			}
-		}
-		if (found) {
-			'Success';
-		} else {
-			'Error: Attachment not found';
-		}
-	}
-} catch (e) {
-	'Error: ' + e;
-}
-`, escapeJSString(accountName), escapeJSString(mailboxName), escapeJSString(messageID), escapeJSString(attachmentName), escapeJSString(savePath))
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return err
-	}
-	if strings.Contains(output, "Error") {
-		return fmt.Errorf(output)
-	}
-	return nil
-}
-
-// SearchMessagesJSON searches for messages across mailboxes
-// Note: By default only searches INBOX mailboxes for performance reasons
-func (c *Client) SearchMessagesJSON(query string, accountName string, mailboxName string, limit int) ([]Message, error) {
-	// Set a reasonable default limit if none specified
-	if limit == 0 {
-		limit = 50
-	}
-
-	// If specific mailbox requested, use single JXA call for simplicity
-	if mailboxName != "" {
-		return c.searchMessagesInSingleMailbox(query, accountName, mailboxName, limit)
-	}
-
-	// Get list of mailboxes to search
-	mailboxes, err := c.GetMailboxesJSON(accountName, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get mailboxes: %w", err)
-	}
-
-	// Filter to only INBOX mailboxes for performance (unless specific account given)
-	var mailboxesToSearch []Mailbox
-	for _, mbox := range mailboxes {
-		if mbox.Name == "INBOX" || mbox.Name == "Inbox" {
-			mailboxesToSearch = append(mailboxesToSearch, mbox)
-		}
-	}
-
-	if len(mailboxesToSearch) == 0 {
-		return []Message{}, nil
-	}
-
-	// If only one mailbox, no need for parallelization
-	if len(mailboxesToSearch) == 1 {
-		return c.searchMessagesInSingleMailbox(query, mailboxesToSearch[0].Account, mailboxesToSearch[0].Name, limit)
-	}
-
-	// Search mailboxes in parallel
-	type result struct {
-		messages []Message
-		err      error
-	}
-	results := make(chan result, len(mailboxesToSearch))
-
-	// Launch goroutine for each mailbox
-	for _, mbox := range mailboxesToSearch {
-		go func(accName, mboxName string) {
-			messages, err := c.searchMessagesInSingleMailbox(query, accName, mboxName, limit)
-			results <- result{messages: messages, err: err}
-		}(mbox.Account, mbox.Name)
-	}
-
-	// Collect results
-	var allMessages []Message
-	var errors []error
-	for i := 0; i < len(mailboxesToSearch); i++ {
-		res := <-results
-		if res.err != nil {
-			errors = append(errors, res.err)
-		} else {
-			allMessages = append(allMessages, res.messages...)
-		}
-	}
-
-	// Return partial results even if some mailboxes failed
-	if len(errors) > 0 && len(allMessages) == 0 {
-		return nil, fmt.Errorf("failed to search all mailboxes: %v", errors)
-	}
-
-	// Sort by date received (newest first) and apply limit
-	sort.Slice(allMessages, func(i, j int) bool {
-		return allMessages[i].DateReceived > allMessages[j].DateReceived
-	})
-
-	if len(allMessages) > limit {
-		allMessages = allMessages[:limit]
-	}
-
-	return allMessages, nil
-}
-
-// searchMessagesInSingleMailbox searches for messages in a specific mailbox
-func (c *Client) searchMessagesInSingleMailbox(query, accountName, mailboxName string, limit int) ([]Message, error) {
-	// Use helper for escaping
-	escapedQuery := escapeJSString(query)
-	escapedAccount := escapeJSString(accountName)
-	escapedMailbox := escapeJSString(mailboxName)
-
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-const result = [];
-const searchTerm = '%s'.toLowerCase();
-const maxResults = %d;
-`+jsResolveMailbox+`
-try {
-	const acc = mail.accounts.byName('%s');
-	const mbox = resolveMailbox(acc, '%s');
-	if (!mbox) throw 'Mailbox not found';
-	const accName = acc.name();
-	const mboxName = mbox.name();
-	const messages = mbox.messages();
-	// Limit how many messages to check per mailbox for performance
-	// Messages are typically sorted newest first, so this checks recent messages
-	const maxToCheck = Math.min(messages.length, 500);
-
-	for (let k = 0; k < maxToCheck && result.length < maxResults; k++) {
-		const msg = messages[k];
-		try {
-			const subject = (msg.subject() || '').toLowerCase();
-			const sender = (msg.sender() || '').toLowerCase();
-
-			// Only search subject and sender
-			if (subject.includes(searchTerm) || sender.includes(searchTerm)) {
-				result.push({
-					id: String(msg.id()),
-					messageId: msg.messageId() || '',
-					subject: msg.subject() || '',
-					sender: msg.sender() || '',
-					dateReceived: (msg.dateReceived() || new Date()).toISOString(),
-					dateSent: (msg.dateSent() || new Date()).toISOString(),
-					read: msg.readStatus(),
-					flagged: msg.flaggedStatus(),
-					messageSize: msg.messageSize(),
-					mailbox: mboxName,
-					account: accName
-				});
-			}
-		} catch (e) {
-			// Skip messages that cause errors
-		}
-	}
-} catch (e) {
-	// Handle errors gracefully
-}
-
-JSON.stringify(result);
-`, escapedQuery, limit, escapedAccount, escapedMailbox)
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return nil, err
-	}
-
-	var messages []Message
-	if err := json.Unmarshal([]byte(output), &messages); err != nil {
-		return nil, fmt.Errorf("failed to parse search results JSON: %w", err)
-	}
-
-	return messages, nil
 }
 
 // GetMessagesFromMultipleMailboxes loads messages from multiple mailboxes concurrently
@@ -1316,39 +948,6 @@ JSON.stringify(out);
 		return nil, fmt.Errorf("%s", raw.Error)
 	}
 	return raw.IDs, nil
-}
-
-// archiveCandidates are the names an account's archive mailbox goes by. Mail.app
-// exposes no unified archive accessor (unlike inbox/sent/drafts/trash/junk) and
-// the name is localized, so it has to be looked for by name. "All Mail" is
-// deliberately absent: on Gmail it is every message, not an archive.
-var archiveCandidates = []string{"Archive", "存档", "归档", "Archives", "已归档", "封存"}
-
-// ArchiveMailboxName resolves the name of an account's archive mailbox, or ""
-// when the account has none under any known name.
-func (c *Client) ArchiveMailboxName(accountName string) (string, error) {
-	candidates, _ := json.Marshal(archiveCandidates)
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-`+jsResolveMailbox+`
-const candidates = %s;
-const acc = mail.accounts.byName('%s');
-let found = '';
-for (const name of candidates) {
-	try { if (resolveMailbox(acc, name)) { found = name; break; } } catch (e) {}
-}
-JSON.stringify(found);
-`, string(candidates), escapeJSString(accountName))
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return "", err
-	}
-	var name string
-	if err := json.Unmarshal([]byte(output), &name); err != nil {
-		return "", fmt.Errorf("unexpected output: %s", output)
-	}
-	return name, nil
 }
 
 // GetUnifiedMessagesJSON retrieves messages from unified views across all accounts.
@@ -1697,35 +1296,6 @@ func (c *Client) MoveMessages(accountName, sourceMailbox string, messageIDs []st
 	return c.mutateMessages(accountName, sourceMailbox, messageIDs, prelude, "mail.move(msg, { to: destMbox });")
 }
 
-// ArchiveMessages moves messages to the provider's archive mailbox.
-//
-// Gmail accounts (detected by the presence of an "All Mail" mailbox) are
-// refused: Mail.app offers no safe, scriptable archive for Gmail. Every
-// mechanism was tested and fails:
-//   - Scripted moves out of INBOX (mailbox property or the move command)
-//     behave as label copies on Gmail's IMAP bridge — the message reappears
-//     in the inbox on the next sync.
-//   - Moving through Trash (move to Trash, then move back out to All Mail)
-//     does archive, but races Gmail's "expunged from Trash = permanently
-//     deleted" rule and was observed to permanently delete messages.
-//   - message.deletedStatus is read-only.
-//   - Driving Mail's own Archive command works reliably but requires UI
-//     automation that activates Mail and steals focus.
-//
-// Archiving Gmail from the CLI therefore needs the Gmail API, not Mail.app.
-//
-// Other providers (Exchange, Fastmail, ...) do real moves, so a plain move
-// to their "Archive" mailbox works.
-//
-// All messages are processed in one Mail.app round trip.
-func (c *Client) ArchiveMessages(accountName, mailboxName string, messageIDs []string) (*MutationResult, error) {
-	prelude := `if (resolveMailbox(acc, 'All Mail')) throw 'Gmail accounts cannot be archived safely via Mail.app scripting. ' +
-		'Archive it in Mail.app or Gmail directly, or use "messages quarantine" to park it in a holding mailbox.';
-	const destMbox = archiveBox(acc);
-	if (!destMbox) throw 'Archive mailbox not found';`
-	return c.mutateMessages(accountName, mailboxName, messageIDs, jsArchiveBox+prelude, "mail.move(msg, { to: destMbox });")
-}
-
 // QuarantineMessages moves several messages into a holding mailbox instead of
 // deleting them. Nothing is destroyed and the move is reversible from Mail.app,
 // so this is the safe replacement for `messages delete`.
@@ -1741,7 +1311,7 @@ func (c *Client) QuarantineMessages(mailboxName string, messageIDs []string) (*G
 	if mailboxName == "" {
 		mailboxName = DefaultQuarantineMailbox
 	}
-	return c.MutateMessagesGlobal(messageIDs, "quarantine", mailboxName, "")
+	return c.MutateMessagesGlobal(messageIDs, "quarantine", mailboxName)
 }
 
 // QuarantineMessagesIn is the scoped form of QuarantineMessages: the messages
@@ -1756,139 +1326,6 @@ func (c *Client) QuarantineMessagesIn(accountName, mailboxName, boxName string, 
 	return c.mutateMessages(accountName, mailboxName, messageIDs, prelude, "mail.move(msg, { to: destMbox });")
 }
 
-// MailboxMarkResult reports one mailbox touched by a mark-read operation.
-type MailboxMarkResult struct {
-	Account string `json:"account"`
-	Mailbox string `json:"mailbox"`
-	Changed int    `json:"changed"`
-	Error   string `json:"error,omitempty"`
-}
-
-// jsMarkMailbox marks every message in `mb` whose readStatus != read and
-// returns the count. Bulk property assignment on a whose() specifier is not
-// supported by Mail.app, so this loops over the filtered result.
-const jsMarkMailbox = `
-function markMailbox(mb, read, dryRun) {
-	// unreadCount is a cheap property; skip the full whose() scan when
-	// there is nothing to do (only valid when marking read).
-	if (read) { try { if (mb.unreadCount() === 0) return 0; } catch (e) {} }
-	const pending = mb.messages.whose({ readStatus: !read })();
-	if (!dryRun) {
-		for (let i = 0; i < pending.length; i++) pending[i].readStatus = read;
-	}
-	return pending.length;
-}
-`
-
-// MarkMailboxRead marks all messages in one mailbox read (or unread) and
-// returns the number of messages changed. With dryRun it only counts.
-func (c *Client) MarkMailboxRead(accountName, mailboxName string, read, dryRun bool) (int, error) {
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-`+jsResolveMailbox+jsMarkMailbox+`
-try {
-	const acc = mail.accounts.byName('%s');
-	const mbox = resolveMailbox(acc, '%s');
-	if (!mbox) throw 'Mailbox not found';
-	JSON.stringify({ changed: markMailbox(mbox, %t, %t) });
-} catch (e) {
-	JSON.stringify({ error: String(e) });
-}
-`, escapeJSString(accountName), escapeJSString(mailboxName), read, dryRun)
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return 0, err
-	}
-	var raw struct {
-		Error   string `json:"error"`
-		Changed int    `json:"changed"`
-	}
-	if err := json.Unmarshal([]byte(output), &raw); err != nil {
-		return 0, fmt.Errorf("unexpected output: %s", output)
-	}
-	if raw.Error != "" {
-		return 0, fmt.Errorf("%s", raw.Error)
-	}
-	return raw.Changed, nil
-}
-
-// MarkSpecialMailboxesRead marks every per-account mailbox of the given kinds
-// read (or unread) in a single JXA call. kinds may contain "trash", "junk"
-// and "archive". Trash and junk resolve through Mail.app's unified
-// trashMailbox/junkMailbox properties, so provider naming (Trash vs
-// "Deleted Items", Spam vs "Junk Email") is handled by Mail itself. Archive
-// resolves a mailbox literally named "Archive" in each account's tree;
-// Gmail's "All Mail" is deliberately not treated as archive because it also
-// contains every inbox message. accounts, if non-empty, restricts to those
-// account names.
-func (c *Client) MarkSpecialMailboxesRead(kinds []string, accounts []string, read, dryRun bool) ([]MailboxMarkResult, error) {
-	kindsJSON, _ := json.Marshal(kinds)
-	if accounts == nil {
-		accounts = []string{}
-	}
-	accountsJSON, _ := json.Marshal(accounts)
-
-	script := fmt.Sprintf(`
-const mail = Application('Mail');
-`+jsResolveMailbox+jsMarkMailbox+`
-const kinds = %s;
-const onlyAccounts = %s;
-const read = %t;
-const dryRun = %t;
-const results = [];
-function wanted(accName) {
-	return onlyAccounts.length === 0 || onlyAccounts.indexOf(accName) >= 0;
-}
-function handle(accName, mb) {
-	const r = { account: accName, mailbox: '', changed: 0 };
-	try {
-		r.mailbox = mb.name();
-		r.changed = markMailbox(mb, read, dryRun);
-	} catch (e) {
-		r.error = String(e);
-	}
-	results.push(r);
-}
-for (const kind of kinds) {
-	if (kind === 'trash' || kind === 'junk') {
-		const subs = mail[kind + 'Mailbox']().mailboxes();
-		for (let i = 0; i < subs.length; i++) {
-			let accName = '';
-			try { accName = subs[i].account().name(); } catch (e) { continue; }
-			if (wanted(accName)) handle(accName, subs[i]);
-		}
-	} else if (kind === 'archive') {
-		const accs = mail.accounts();
-		for (let i = 0; i < accs.length; i++) {
-			const accName = accs[i].name();
-			if (!wanted(accName)) continue;
-			let mb = null;
-			try { mb = resolveMailbox(accs[i], 'Archive'); } catch (e) {}
-			if (mb) handle(accName, mb);
-		}
-	} else {
-		results.push({ account: '', mailbox: kind, changed: 0, error: 'unknown mailbox kind' });
-	}
-}
-JSON.stringify(results);
-`, string(kindsJSON), string(accountsJSON), read, dryRun)
-
-	output, err := c.runJXA(script)
-	if err != nil {
-		return nil, err
-	}
-	var results []MailboxMarkResult
-	if err := json.Unmarshal([]byte(output), &results); err != nil {
-		return nil, fmt.Errorf("unexpected output: %s", output)
-	}
-	return results, nil
-}
-
-// GlobalResult is the per-message outcome of a global (no account/mailbox)
-
-// GlobalSummary aggregates GlobalResults.
-
 // GlobalResult is the per-message outcome of a global (no account/mailbox)
 // mutation. Status is one of ok, missing, failed, skipped.
 type GlobalResult struct {
@@ -1896,7 +1333,6 @@ type GlobalResult struct {
 	Account string `json:"account,omitempty"`
 	Mailbox string `json:"mailbox,omitempty"`
 	Status  string `json:"status"`
-	Gmail   bool   `json:"gmail,omitempty"`
 	Error   string `json:"error,omitempty"`
 }
 
@@ -1906,11 +1342,9 @@ type GlobalSummary struct {
 	OK      int            `json:"ok"`
 	Missing int            `json:"missing"`
 	Failed  int            `json:"failed"`
-	Skipped int            `json:"skipped"`
 }
 
-// Err returns an error if any message was missing or failed (skips are not
-// errors: they are reported deliberately).
+// Err returns an error if any message was missing or failed.
 func (s *GlobalSummary) Err() error {
 	if s.Missing == 0 && s.Failed == 0 {
 		return nil
@@ -1934,31 +1368,22 @@ func (s *GlobalSummary) Err() error {
 // accounts can be handled in one round trip.
 //
 // action: "read", "unread", "flag", "unflag", "quarantine" (target is a holding
-// mailbox that must already exist inside each message's own account), "move"
-// (target is the destination mailbox name within each message's own account) or
-// "archive". For archive, gmailPolicy decides what
-// happens to messages in Gmail accounts (which cannot be archived safely via
-// scripting, see ArchiveMessages): "skip" (default) or "read" (just mark read).
+// mailbox that must already exist inside each message's own account) or "move"
+// (target is the destination mailbox name within each message's own account).
 //
 // There is deliberately no "delete" action.
-func (c *Client) MutateMessagesGlobal(messageIDs []string, action, target, gmailPolicy string) (*GlobalSummary, error) {
+func (c *Client) MutateMessagesGlobal(messageIDs []string, action, target string) (*GlobalSummary, error) {
 	idsJSON, _ := json.Marshal(messageIDs)
-	if gmailPolicy == "" {
-		gmailPolicy = "skip"
-	}
 	script := fmt.Sprintf(`
 const mail = Application('Mail');
-`+jsResolveMailbox+jsArchiveBox+`
+`+jsResolveMailbox+`
 const wanted = %s;
 const action = '%s';
 const target = '%s';
-const gmailPolicy = '%s';
 const results = [];
 // Any container works for byId; the unified inbox is always present.
 const container = mail.inbox().messages;
-const archiveBoxes = {};
 const quarantineBoxes = {};
-const isGmail = {};
 for (const id of wanted) {
 	const r = { id: id, status: 'ok' };
 	try {
@@ -1971,8 +1396,6 @@ for (const id of wanted) {
 		const acc = mbox.account();
 		const accName = acc.name();
 		r.account = accName;
-		if (isGmail[accName] === undefined) isGmail[accName] = !!resolveMailbox(acc, 'All Mail');
-		r.gmail = isGmail[accName];
 		switch (action) {
 		case 'read': msg.readStatus = true; break;
 		case 'unread': msg.readStatus = false; break;
@@ -1991,17 +1414,6 @@ for (const id of wanted) {
 			mail.move(msg, { to: dest });
 			break;
 		}
-		case 'archive': {
-			if (r.gmail) {
-				if (gmailPolicy === 'read') { msg.readStatus = true; }
-				else { r.status = 'skipped'; r.error = 'Gmail accounts cannot be archived via Mail.app scripting'; }
-				break;
-			}
-			if (archiveBoxes[accName] === undefined) archiveBoxes[accName] = archiveBox(acc);
-			if (!archiveBoxes[accName]) throw 'Archive mailbox not found in ' + accName;
-			mail.move(msg, { to: archiveBoxes[accName] });
-			break;
-		}
 		default: throw 'unknown action ' + action;
 		}
 	} catch (e) {
@@ -2010,7 +1422,7 @@ for (const id of wanted) {
 	results.push(r);
 }
 JSON.stringify(results);
-`, string(idsJSON), escapeJSString(action), escapeJSString(target), escapeJSString(gmailPolicy))
+`, string(idsJSON), escapeJSString(action), escapeJSString(target))
 
 	output, err := c.runJXA(script)
 	if err != nil {
@@ -2029,8 +1441,6 @@ JSON.stringify(results);
 			s.Missing++
 		case "failed":
 			s.Failed++
-		case "skipped":
-			s.Skipped++
 		}
 	}
 	return s, nil
