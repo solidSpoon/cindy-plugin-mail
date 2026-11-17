@@ -61,8 +61,11 @@ func TestSchemaDescribesEveryAction(t *testing.T) {
 			t.Errorf("%s has no params properties: %+v", a.Name, a.Params)
 			continue
 		}
-		if len(props) == 0 && a.Name != "schema" {
+		if len(props) == 0 && a.Name != "schema" && a.Name != "accounts.list" {
 			t.Errorf("%s documents no parameters", a.Name)
+		}
+		if _, hasNoCache := props["noCache"]; hasNoCache {
+			t.Errorf("%s should not expose noCache", a.Name)
 		}
 	}
 	for _, want := range []string{"schema", "messages.list", "messages.patch", "messages.quarantine", "draft"} {
@@ -115,7 +118,7 @@ func TestSchemaSharesNestedTypesUnderDefs(t *testing.T) {
 }
 
 func TestExecuteSingleOperation(t *testing.T) {
-	resp, opts := run(t, `{"action":"draft","params":{"recipients":{"to":["a@x.com"]},"content":{"subject":"hi","body":"b"},"dryRun":true},"pretty":true}`)
+	resp, opts := run(t, `{"action":"draft","params":{"account":"A","recipients":{"to":["a@x.com"]},"content":{"subject":"hi","body":"b"},"dryRun":true},"pretty":true}`)
 	if !resp.OK || resp.OKCount != 1 || resp.Failed != 0 {
 		t.Fatalf("unexpected envelope: %+v", resp)
 	}
@@ -197,9 +200,9 @@ func TestPatchRequiresSomethingToSet(t *testing.T) {
 
 func TestExecuteBatchKeepsGoingAfterAFailure(t *testing.T) {
 	doc := `{"ops":[
-		{"action":"draft","params":{"recipients":{"to":["a@x.com"]},"content":{"subject":"s"},"dryRun":true}},
+		{"action":"draft","params":{"account":"A","recipients":{"to":["a@x.com"]},"content":{"subject":"s"},"dryRun":true}},
 		{"action":"nope","params":{}},
-		{"action":"draft","params":{"recipients":{"to":["b@x.com"]},"content":{"subject":"s2"},"dryRun":true}}
+		{"action":"draft","params":{"account":"A","recipients":{"to":["b@x.com"]},"content":{"subject":"s2"},"dryRun":true}}
 	]}`
 	resp, _ := run(t, doc)
 	if resp.OK {
@@ -380,20 +383,12 @@ func TestBuildDigestGroupsAndSorts(t *testing.T) {
 	if groups[1].Count != 1 {
 		t.Fatalf("unexpected second group: %+v", groups[1])
 	}
-}
-
-func TestDigestHasNoDeadNoCache(t *testing.T) {
-	schema := schemaOf(t)
-	for _, a := range schema.Actions {
-		if a.Name == "messages.digest" {
-			props := a.Params["properties"].(map[string]any)
-			if _, ok := props["noCache"]; ok {
-				t.Errorf("messages.digest should not expose unused noCache")
-			}
-			return
-		}
+	if e := firstError(t, `{"action":"mailboxes.list","params":{}}`); e.Code != CodeInvalidRequest || !strings.Contains(e.Message, "params.account") {
+		t.Errorf("mailboxes.list should require account, got %+v", e)
 	}
-	t.Fatal("messages.digest not found in schema")
+	if e := firstError(t, `{"action":"draft","params":{"recipients":{"to":["a@x.com"]},"content":{"subject":"s"}}}`); e.Code != CodeInvalidRequest || !strings.Contains(e.Message, "params.account") {
+		t.Errorf("draft should require account, got %+v", e)
+	}
 }
 
 func TestStillInSourceVerification(t *testing.T) {

@@ -138,8 +138,6 @@ func init() {
 			if e != nil && out["error"] == nil {
 				out["error"] = e.Error()
 			}
-			invalidateMailboxCache(req.In.Account, req.In.Mailbox)
-			invalidateMailboxListCache()
 		}
 
 		if req.Set.Flagged != nil {
@@ -157,7 +155,6 @@ func init() {
 			if e != nil && out["error"] == nil {
 				out["error"] = e.Error()
 			}
-			invalidateMailboxCache(req.In.Account, req.In.Mailbox)
 		}
 
 		if msg, ok := out["error"].(string); ok {
@@ -204,9 +201,6 @@ func init() {
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "move failed: %v", err)
 		}
-		invalidateMailboxCache(req.In.Account, req.In.Mailbox)
-		invalidateMailboxCache(req.In.Account, req.To)
-		invalidateMailboxListCache()
 		data, partialErr := mutationData(res, "moved to "+req.To)
 		report := confirmMoved(client, before, res.Succeeded, fixedDest(req.To))
 		attachReport(data, report)
@@ -264,9 +258,6 @@ func init() {
 		if err != nil {
 			return nil, quarantineError(err)
 		}
-		invalidateMailboxCache(req.In.Account, req.In.Mailbox)
-		invalidateMailboxCache(req.In.Account, to)
-		invalidateMailboxListCache()
 		data, partialErr := mutationData(res, "quarantined in "+to)
 		if m, ok := data.(map[string]any); ok && req.MarkRead {
 			m["markedRead"] = true
@@ -287,7 +278,7 @@ type DraftContent struct {
 }
 
 type DraftParams struct {
-	Account    string       `json:"account,omitempty" desc:"account to draft from; inferred from from, or the only account, when omitted"`
+	Account    string       `json:"account" req:"1" desc:"account to draft from, e.g. \"Exchange\""`
 	From       string       `json:"from,omitempty" desc:"From address, e.g. \"名字 <a@b.com>\""`
 	Recipients Recipients   `json:"recipients" req:"1" desc:"who the message is addressed to"`
 	Content    DraftContent `json:"content" req:"1" desc:"subject, body and attachments"`
@@ -309,16 +300,7 @@ func init() {
 			}, nil
 		}
 		client := mail.NewClient()
-		account := req.Account
-		if account == "" && req.From != "" {
-			if accounts, err := client.GetAccountsJSON(); err == nil {
-				account = matchAccount(accounts, req.From)
-			}
-		}
-		if account == "" {
-			return nil, errf(CodeInvalidRequest, "account is required (or give from matching a configured account)")
-		}
-		result, err := client.SaveDraft(account, req.From, req.Content.Subject, req.Content.Body,
+		result, err := client.SaveDraft(req.Account, req.From, req.Content.Subject, req.Content.Body,
 			req.Recipients.To, req.Recipients.Cc, req.Recipients.Bcc, req.Content.Attach)
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to save draft: %v", err)
@@ -331,24 +313,4 @@ func init() {
 		}
 		return data, nil
 	})
-}
-
-// matchAccount finds the account whose address (or alias) matches a From value.
-func matchAccount(accounts []mail.Account, from string) string {
-	want := strings.ToLower(strings.TrimSpace(from))
-	if i, j := strings.Index(want, "<"), strings.Index(want, ">"); i >= 0 && j > i {
-		want = want[i+1 : j]
-	}
-	want = strings.TrimSpace(want)
-	for _, acc := range accounts {
-		if strings.ToLower(acc.EmailAddress) == want {
-			return acc.Name
-		}
-		for _, alias := range acc.EmailAddresses {
-			if strings.ToLower(alias) == want {
-				return acc.Name
-			}
-		}
-	}
-	return ""
 }
