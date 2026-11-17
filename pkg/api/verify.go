@@ -199,14 +199,3 @@ func attachReport(data any, report *moveReport) {
 		m["warnings"] = report.Warnings
 	}
 }
-
-// succeededIDs lists the ids a global mutation reported as handled.
-func succeededIDs(sum *mail.GlobalSummary) []string {
-	ids := make([]string, 0, len(sum.Results))
-	for _, r := range sum.Results {
-		if r.Status == "ok" {
-			ids = append(ids, r.ID)
-		}
-	}
-	return ids
-}

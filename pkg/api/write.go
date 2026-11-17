@@ -16,18 +16,14 @@ func boolOr(ptr *bool, def bool) bool {
 	return *ptr
 }
 
-// dryRunLocations answers "what would this touch?" without touching anything.
-func dryRunLocations(ids []string) (any, error) {
-	locations, err := mail.NewClient().ResolveMessages(ids)
+// dryRunScoped answers "what would this touch?" without touching anything.
+func dryRunScoped(client *mail.Client, in MailboxRef, ids []string) ([]mail.MessageLocation, []string, error) {
+	locations, err := client.ResolveMessages(ids)
 	if err != nil {
-		return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
+		return nil, nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
 	}
 	wouldAffect, missing := partitionLocations(locations)
-	return map[string]any{
-		"dryRun":      true,
-		"wouldAffect": wouldAffect,
-		"missing":     missing,
-	}, nil
+	return wouldAffect, missing, nil
 }
 
 func partitionLocations(locations []mail.MessageLocation) ([]mail.MessageLocation, []string) {
@@ -50,65 +46,22 @@ func defaultQuarantineBox() string {
 	return mail.DefaultQuarantineMailbox
 }
 
-func checkDestMailboxes(client *mail.Client, wouldAffect []mail.MessageLocation, ref *mailboxRef, dest string, holding bool) *Error {
-	seen := map[string]bool{}
-	var accounts []string
-	if ref != nil && ref.account != "" {
-		seen[ref.account] = true
-		accounts = append(accounts, ref.account)
+func checkDestMailbox(client *mail.Client, account, dest string, holding bool) *Error {
+	mailboxes, err := client.GetMailboxesJSON(account, false)
+	if err != nil {
+		return errf(CodeScriptFailed, "failed to verify destination mailbox %q in %s: %v", dest, account, err)
 	}
-	for _, loc := range wouldAffect {
-		if loc.Account != "" && !seen[loc.Account] {
-			seen[loc.Account] = true
-			accounts = append(accounts, loc.Account)
+	for _, mb := range mailboxes {
+		if mb.Name == dest {
+			return nil
 		}
 	}
-	for _, account := range accounts {
-		mailboxes, err := client.GetMailboxesJSON(account, false)
-		if err != nil {
-			return errf(CodeScriptFailed, "failed to verify destination mailbox %q in %s: %v", dest, account, err)
-		}
-		found := false
-		for _, mb := range mailboxes {
-			if mb.Name == dest {
-				found = true
-				break
-			}
-		}
-		if !found {
-			if holding {
-				return errf(CodeHoldingBoxMissing, "holding mailbox %q does not exist in %s", dest, account).
-					withHint("create the mailbox in Mail.app, or pass a box that exists")
-			}
-			return errf(CodeMailboxMissing, "destination mailbox %q does not exist in %s", dest, account).
-				withHint("create the mailbox in Mail.app first, or list existing mailboxes with mailboxes.list")
-		}
+	if holding {
+		return errf(CodeHoldingBoxMissing, "holding mailbox %q does not exist in %s", dest, account).
+			withHint("create the mailbox in Mail.app, or pass a destination that exists via \"to\"")
 	}
-	return nil
-}
-
-func invalidateLocationsCache(locations []mail.MessageLocation, destMailbox string) {
-	seen := map[string]bool{}
-	for _, loc := range locations {
-		if !loc.Exists || loc.Account == "" {
-			continue
-		}
-		if loc.Mailbox != "" {
-			key := loc.Account + "\x00" + loc.Mailbox
-			if !seen[key] {
-				seen[key] = true
-				invalidateMailboxCache(loc.Account, loc.Mailbox)
-			}
-		}
-		if destMailbox != "" {
-			key := loc.Account + "\x00" + destMailbox
-			if !seen[key] {
-				seen[key] = true
-				invalidateMailboxCache(loc.Account, destMailbox)
-			}
-		}
-	}
-	invalidateMailboxListCache()
+	return errf(CodeMailboxMissing, "destination mailbox %q does not exist in %s", dest, account).
+		withHint("create the mailbox in Mail.app first, or list existing mailboxes with mailboxes.list")
 }
 
 func combineMutationError(relocErr, partialErr error) error {
@@ -122,7 +75,6 @@ func mutationData(res *mail.MutationResult, verb string) (any, error) {
 	total := len(res.Succeeded) + len(res.Missing) + len(res.Failed)
 	data := map[string]any{
 		"verb":      verb,
-		"changed":   len(res.Succeeded),
 		"succeeded": res.Succeeded,
 		"missing":   res.Missing,
 		"failed":    res.Failed,
@@ -134,60 +86,41 @@ func mutationData(res *mail.MutationResult, verb string) (any, error) {
 		len(res.Missing)+len(res.Failed), total, verb)
 }
 
-func globalData(sum *mail.GlobalSummary, verb string) (any, error) {
-	data := map[string]any{
-		"verb":    verb,
-		"changed": sum.OK,
-		"results": sum.Results,
-		"missing": sum.Missing,
-		"failed":  sum.Failed,
-	}
-	if sum.Missing == 0 && sum.Failed == 0 {
-		return data, nil
-	}
-	return data, errf(CodePartialFailure, "%d of %d messages were not %s",
-		sum.Missing+sum.Failed, len(sum.Results), verb)
-}
-
 func quarantineError(err error) *Error {
 	if err != nil && strings.Contains(err.Error(), "Holding mailbox") {
 		return errf(CodeHoldingBoxMissing, "%v", err).
-			withHint("create the mailbox in Mail.app, or pass a box that exists")
+			withHint("create the mailbox in Mail.app, or pass a destination that exists via \"to\"")
 	}
 	return errf(CodeScriptFailed, "quarantine failed: %v", err)
 }
 
-// splitIDs reports a mutation's target mailbox, or nil for global resolution.
-// A MailboxRef always carries both fields, so "account without mailbox" is not
-// expressible and needs no runtime check any more.
-func splitRef(ref *MailboxRef) *mailboxRef {
-	if ref == nil {
-		return nil
-	}
-	return &mailboxRef{account: ref.Account, mailbox: ref.Mailbox}
-}
-
-type mailboxRef struct{ account, mailbox string }
-
 // ------------------------------------------------------------ messages.patch
 
 type MessagesPatchParams struct {
-	IDs    []string    `json:"ids" req:"1" desc:"Mail.app message ids; all of them are handled in one call"`
-	In     *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
-	Set    StateSet    `json:"set" req:"1" desc:"the flags to set; a field left out is left untouched"`
-	DryRun bool        `json:"dryRun,omitempty" desc:"report what would change and change nothing"`
+	IDs    []string   `json:"ids" req:"1" desc:"Mail.app message ids; all of them are handled in one call"`
+	In     MailboxRef `json:"in" req:"1" desc:"the mailbox these messages live in"`
+	Set    StateSet   `json:"set" req:"1" desc:"the flags to set; a field left out is left untouched"`
+	DryRun bool       `json:"dryRun,omitempty" desc:"report what would change and change nothing"`
 }
 
 func init() {
-	Register("messages.patch", "Set read/flagged state on messages in one Mail.app call", func(req MessagesPatchParams) (any, error) {
+	Register("messages.patch", "Set read/flagged state on messages in one mailbox", func(req MessagesPatchParams) (any, error) {
 		if req.Set.Empty() {
 			return nil, errf(CodeInvalidRequest, "messages.patch: set must name read and/or flagged")
 		}
-		if req.DryRun {
-			return dryRunLocations(req.IDs)
-		}
-		ref := splitRef(req.In)
 		client := mail.NewClient()
+		if req.DryRun {
+			wouldAffect, missing, err := dryRunScoped(client, req.In, req.IDs)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"dryRun":      true,
+				"in":          req.In,
+				"wouldAffect": wouldAffect,
+				"missing":     missing,
+			}, nil
+		}
 		out := map[string]any{}
 
 		if req.Set.Read != nil {
@@ -196,34 +129,17 @@ func init() {
 			if !read {
 				verb = "marked unread"
 			}
-			if ref != nil {
-				res, err := client.MarkMessages(ref.account, ref.mailbox, req.IDs, read)
-				if err != nil {
-					return nil, errf(CodeScriptFailed, "mark failed: %v", err)
-				}
-				data, e := mutationData(res, verb)
-				out["read"] = data
-				if e != nil && out["error"] == nil {
-					out["error"] = e.Error()
-				}
-				invalidateMailboxCache(ref.account, ref.mailbox)
-			} else {
-				action := "read"
-				if !read {
-					action = "unread"
-				}
-				sum, err := client.MutateMessagesGlobal(req.IDs, action, "")
-				if err != nil {
-					return nil, errf(CodeScriptFailed, "mark failed: %v", err)
-				}
-				data, e := globalData(sum, verb)
-				out["read"] = data
-				if e != nil && out["error"] == nil {
-					out["error"] = e.Error()
-				}
-				invalidateMailboxCache("", "")
-				invalidateMailboxListCache()
+			res, err := client.MarkMessages(req.In.Account, req.In.Mailbox, req.IDs, read)
+			if err != nil {
+				return nil, errf(CodeScriptFailed, "mark failed: %v", err)
 			}
+			data, e := mutationData(res, verb)
+			out["read"] = data
+			if e != nil && out["error"] == nil {
+				out["error"] = e.Error()
+			}
+			invalidateMailboxCache(req.In.Account, req.In.Mailbox)
+			invalidateMailboxListCache()
 		}
 
 		if req.Set.Flagged != nil {
@@ -232,34 +148,16 @@ func init() {
 			if !flagged {
 				verb = "unflagged"
 			}
-			if ref != nil {
-				res, err := client.FlagMessages(ref.account, ref.mailbox, req.IDs, flagged)
-				if err != nil {
-					return nil, errf(CodeScriptFailed, "flag failed: %v", err)
-				}
-				data, e := mutationData(res, verb)
-				out["flagged"] = data
-				if e != nil && out["error"] == nil {
-					out["error"] = e.Error()
-				}
-				invalidateMailboxCache(ref.account, ref.mailbox)
-			} else {
-				action := "flag"
-				if !flagged {
-					action = "unflag"
-				}
-				sum, err := client.MutateMessagesGlobal(req.IDs, action, "")
-				if err != nil {
-					return nil, errf(CodeScriptFailed, "flag failed: %v", err)
-				}
-				data, e := globalData(sum, verb)
-				out["flagged"] = data
-				if e != nil && out["error"] == nil {
-					out["error"] = e.Error()
-				}
-				invalidateMailboxCache("", "")
-				invalidateMailboxListCache()
+			res, err := client.FlagMessages(req.In.Account, req.In.Mailbox, req.IDs, flagged)
+			if err != nil {
+				return nil, errf(CodeScriptFailed, "flag failed: %v", err)
 			}
+			data, e := mutationData(res, verb)
+			out["flagged"] = data
+			if e != nil && out["error"] == nil {
+				out["error"] = e.Error()
+			}
+			invalidateMailboxCache(req.In.Account, req.In.Mailbox)
 		}
 
 		if msg, ok := out["error"].(string); ok {
@@ -273,27 +171,26 @@ func init() {
 // ------------------------------------------------------------- messages.move
 
 type MessagesMoveParams struct {
-	IDs    []string    `json:"ids" req:"1"`
-	To     string      `json:"to" req:"1" desc:"destination mailbox name inside each message's own account"`
-	In     *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
-	DryRun bool        `json:"dryRun,omitempty"`
+	IDs    []string   `json:"ids" req:"1"`
+	In     MailboxRef `json:"in" req:"1" desc:"the mailbox these messages currently live in"`
+	To     string     `json:"to" req:"1" desc:"destination mailbox name inside the same account"`
+	DryRun bool       `json:"dryRun,omitempty"`
 }
 
 func init() {
-	Register("messages.move", "Move messages to another mailbox. The moved messages get new ids in the destination, and the destination is read back to confirm they arrived", func(req MessagesMoveParams) (any, error) {
-		ref := splitRef(req.In)
+	Register("messages.move", "Move messages to another mailbox in the same account. The moved messages get new ids in the destination, and both source and destination are read back to confirm relocation", func(req MessagesMoveParams) (any, error) {
 		client := mail.NewClient()
 		if req.DryRun {
-			locations, err := client.ResolveMessages(req.IDs)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
-			}
-			wouldAffect, missing := partitionLocations(locations)
-			if e := checkDestMailboxes(client, wouldAffect, ref, req.To, false); e != nil {
+			if e := checkDestMailbox(client, req.In.Account, req.To, false); e != nil {
 				return nil, e
+			}
+			wouldAffect, missing, err := dryRunScoped(client, req.In, req.IDs)
+			if err != nil {
+				return nil, err
 			}
 			return map[string]any{
 				"dryRun":      true,
+				"in":          req.In,
 				"to":          req.To,
 				"wouldAffect": wouldAffect,
 				"missing":     missing,
@@ -303,32 +200,15 @@ func init() {
 		if err != nil {
 			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
 		}
-		verb := "moved to " + req.To
-		var (
-			data       any
-			handled    []string
-			partialErr error
-		)
-		if ref != nil {
-			res, err := client.MoveMessages(ref.account, ref.mailbox, req.IDs, req.To)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "move failed: %v", err)
-			}
-			invalidateMailboxCache(ref.account, ref.mailbox)
-			invalidateMailboxCache(ref.account, req.To)
-			invalidateMailboxListCache()
-			data, partialErr = mutationData(res, verb)
-			handled = res.Succeeded
-		} else {
-			sum, err := client.MutateMessagesGlobal(req.IDs, "move", req.To)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "move failed: %v", err)
-			}
-			invalidateLocationsCache(before, req.To)
-			data, partialErr = globalData(sum, verb)
-			handled = succeededIDs(sum)
+		res, err := client.MoveMessages(req.In.Account, req.In.Mailbox, req.IDs, req.To)
+		if err != nil {
+			return nil, errf(CodeScriptFailed, "move failed: %v", err)
 		}
-		report := confirmMoved(client, before, handled, fixedDest(req.To))
+		invalidateMailboxCache(req.In.Account, req.In.Mailbox)
+		invalidateMailboxCache(req.In.Account, req.To)
+		invalidateMailboxListCache()
+		data, partialErr := mutationData(res, "moved to "+req.To)
+		report := confirmMoved(client, before, res.Succeeded, fixedDest(req.To))
 		attachReport(data, report)
 		return data, combineMutationError(relocationError(report, req.To), partialErr)
 	})
@@ -337,35 +217,32 @@ func init() {
 // ------------------------------------------------------- messages.quarantine
 
 type MessagesQuarantineParams struct {
-	IDs []string `json:"ids" req:"1"`
-	// def has to mirror mail.DefaultQuarantineMailbox: a struct tag cannot
-	// reference a constant.
-	Box      string      `json:"box,omitempty" def:"待删除" desc:"holding mailbox name (default 待删除, or MAIL_APP_CLI_QUARANTINE_BOX); it must already exist in Mail.app, created there by the user - a mailbox created by scripting stays local-only and this tool never creates one"`
-	In       *MailboxRef `json:"in,omitempty" desc:"look the ids up in this mailbox; omit to resolve them globally"`
-	MarkRead bool        `json:"markRead,omitempty" desc:"also mark the quarantined messages as read before moving"`
-	DryRun   bool        `json:"dryRun,omitempty"`
+	IDs      []string   `json:"ids" req:"1"`
+	In       MailboxRef `json:"in" req:"1" desc:"the mailbox these messages currently live in"`
+	To       string     `json:"to,omitempty" def:"待删除" desc:"holding mailbox name (default 待删除, or MAIL_APP_CLI_QUARANTINE_BOX); it must already exist in Mail.app, created there by the user"`
+	MarkRead bool       `json:"markRead,omitempty" desc:"also mark the quarantined messages as read before moving"`
+	DryRun   bool       `json:"dryRun,omitempty"`
 }
 
 func init() {
-	Register("messages.quarantine", "Park messages in a holding mailbox that already exists on the server. This is the safe replacement for deleting: nothing is destroyed, the move is reversible, and the destination is read back to confirm it arrived", func(req MessagesQuarantineParams) (any, error) {
-		ref := splitRef(req.In)
-		box := req.Box
-		if box == "" {
-			box = defaultQuarantineBox()
+	Register("messages.quarantine", "Park messages in a holding mailbox in the same account. This is the safe replacement for deleting: nothing is destroyed, the move is reversible, and both source and destination are read back to confirm", func(req MessagesQuarantineParams) (any, error) {
+		to := req.To
+		if to == "" {
+			to = defaultQuarantineBox()
 		}
 		client := mail.NewClient()
 		if req.DryRun {
-			locations, err := client.ResolveMessages(req.IDs)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
-			}
-			wouldAffect, missing := partitionLocations(locations)
-			if e := checkDestMailboxes(client, wouldAffect, ref, box, true); e != nil {
+			if e := checkDestMailbox(client, req.In.Account, to, true); e != nil {
 				return nil, e
+			}
+			wouldAffect, missing, err := dryRunScoped(client, req.In, req.IDs)
+			if err != nil {
+				return nil, err
 			}
 			out := map[string]any{
 				"dryRun":      true,
-				"box":         box,
+				"in":          req.In,
+				"to":          to,
 				"wouldAffect": wouldAffect,
 				"missing":     missing,
 			}
@@ -379,46 +256,24 @@ func init() {
 			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
 		}
 		if req.MarkRead {
-			if ref != nil {
-				if _, err := client.MarkMessages(ref.account, ref.mailbox, req.IDs, true); err != nil {
-					return nil, errf(CodeScriptFailed, "mark read before quarantine failed: %v", err)
-				}
-			} else {
-				if _, err := client.MutateMessagesGlobal(req.IDs, "read", ""); err != nil {
-					return nil, errf(CodeScriptFailed, "mark read before quarantine failed: %v", err)
-				}
+			if _, err := client.MarkMessages(req.In.Account, req.In.Mailbox, req.IDs, true); err != nil {
+				return nil, errf(CodeScriptFailed, "mark read before quarantine failed: %v", err)
 			}
 		}
-		var (
-			data       any
-			handled    []string
-			partialErr error
-		)
-		if ref != nil {
-			res, err := client.QuarantineMessagesIn(ref.account, ref.mailbox, box, req.IDs)
-			if err != nil {
-				return nil, quarantineError(err)
-			}
-			invalidateMailboxCache(ref.account, ref.mailbox)
-			invalidateMailboxCache(ref.account, box)
-			invalidateMailboxListCache()
-			data, partialErr = mutationData(res, "quarantined in "+box)
-			handled = res.Succeeded
-		} else {
-			sum, err := client.QuarantineMessages(box, req.IDs)
-			if err != nil {
-				return nil, quarantineError(err)
-			}
-			invalidateLocationsCache(before, box)
-			data, partialErr = globalData(sum, "quarantined in "+box)
-			handled = succeededIDs(sum)
+		res, err := client.QuarantineMessagesIn(req.In.Account, req.In.Mailbox, to, req.IDs)
+		if err != nil {
+			return nil, quarantineError(err)
 		}
+		invalidateMailboxCache(req.In.Account, req.In.Mailbox)
+		invalidateMailboxCache(req.In.Account, to)
+		invalidateMailboxListCache()
+		data, partialErr := mutationData(res, "quarantined in "+to)
 		if m, ok := data.(map[string]any); ok && req.MarkRead {
 			m["markedRead"] = true
 		}
-		report := confirmMoved(client, before, handled, fixedDest(box))
+		report := confirmMoved(client, before, res.Succeeded, fixedDest(to))
 		attachReport(data, report)
-		return data, combineMutationError(relocationError(report, box), partialErr)
+		return data, combineMutationError(relocationError(report, to), partialErr)
 	})
 }
 

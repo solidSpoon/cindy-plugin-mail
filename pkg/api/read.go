@@ -175,8 +175,8 @@ type compactMessage struct {
 	Subject string `json:"subject"`
 }
 
-func projectMessages(messages []mail.Message, format string) any {
-	if format != "compact" {
+func projectMessages(messages []mail.Message, full bool) any {
+	if full {
 		return messages
 	}
 	out := make([]compactMessage, 0, len(messages))
@@ -198,27 +198,18 @@ const (
 	defaultDigestLimit = 200
 )
 
-// MessagesListParams reads either one named mailbox or one cross-account view.
-//
-// The two forms are a single action because they share everything else: the
-// filters, pagination, projection and body reading are identical. They cannot be
-// a single addressable target, though: a view resolves the right mailbox name
-// per account (收件箱 vs INBOX vs All Mail), which no account+mailbox pair can
-// express.
+// MessagesListParams reads messages from one named mailbox inside one account.
 type MessagesListParams struct {
-	Box         string `json:"box,omitempty" enum:"inbox|unread|flagged|sent|drafts|trash|junk" desc:"read one cross-account view across every account; mutually exclusive with account and mailbox"`
-	Account     string `json:"account,omitempty" desc:"account name, e.g. \"Exchange\"; required together with mailbox unless box is given"`
-	Mailbox     string `json:"mailbox,omitempty" desc:"mailbox name inside that account, e.g. \"收件箱\"; required together with account unless box is given"`
-	Unread      bool   `json:"unread,omitempty" desc:"only unread messages (account+mailbox form only)"`
-	Flagged     bool   `json:"flagged,omitempty" desc:"only flagged messages"`
-	Since       string `json:"since,omitempty" desc:"only messages received at or after this date: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"`
-	Query       string `json:"query,omitempty" desc:"case-insensitive substring match on subject and sender (local metadata filter, never reads bodies)"`
-	Limit       int    `json:"limit,omitempty" def:"60" desc:"maximum messages to return"`
-	Offset      int    `json:"offset,omitempty" desc:"messages to skip (pagination)"`
-	WithContent bool   `json:"withContent,omitempty" desc:"include bodies; can block Mail.app while a body downloads, so prefer small mailboxes"`
-	WithHeaders bool   `json:"withHeaders,omitempty" desc:"include InReplyTo/References for threading (about 9x slower)"`
-	NoCache     bool   `json:"noCache,omitempty" desc:"bypass the short-lived list cache"`
-	Format      string `json:"format,omitempty" enum:"full|compact" def:"full" desc:"compact drops fields that are empty for the query"`
+	In          MailboxRef `json:"in" req:"1" desc:"the mailbox to list"`
+	Unread      bool       `json:"unread,omitempty" desc:"only unread messages"`
+	Flagged     bool       `json:"flagged,omitempty" desc:"only flagged messages"`
+	Since       string     `json:"since,omitempty" desc:"only messages received at or after this date: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"`
+	Query       string     `json:"query,omitempty" desc:"case-insensitive substring match on subject and sender (local metadata filter, never reads bodies)"`
+	Limit       int        `json:"limit,omitempty" def:"60" desc:"maximum messages to return"`
+	Offset      int        `json:"offset,omitempty" desc:"messages to skip (pagination)"`
+	WithContent bool       `json:"withContent,omitempty" desc:"include bodies (switches to full message shape; can block Mail.app while a body downloads)"`
+	WithHeaders bool       `json:"withHeaders,omitempty" desc:"include InReplyTo/References for threading (switches to full message shape; about 9x slower)"`
+	NoCache     bool       `json:"noCache,omitempty" desc:"bypass the short-lived list cache"`
 }
 
 func filterMessagesByQuery(messages []mail.Message, query string) []mail.Message {
@@ -251,58 +242,13 @@ func paginateMessages(messages []mail.Message, offset, limit int) ([]mail.Messag
 }
 
 func init() {
-	Register("messages.list", "List messages in one mailbox, or one cross-account view with box", func(req MessagesListParams) (any, error) {
+	Register("messages.list", "List messages in one mailbox (compact triage fields by default)", func(req MessagesListParams) (any, error) {
 		if req.Limit <= 0 {
 			req.Limit = defaultListLimit
 		}
-		if req.Box != "" {
-			if req.Account != "" || req.Mailbox != "" {
-				return nil, errf(CodeInvalidRequest,
-					"messages.list: box cannot be combined with account or mailbox")
-			}
-			if req.Unread || req.Flagged || req.NoCache {
-				return nil, errf(CodeInvalidRequest,
-					"messages.list: unread, flagged and noCache apply to account+mailbox only; a box view already filters and is never cached")
-			}
-			fetchLimit, fetchOffset := req.Limit, req.Offset
-			if req.Query != "" {
-				// Filter in Go after fetching metadata so offset/limit apply to
-				// the matched subset rather than before matching.
-				fetchLimit, fetchOffset = 0, 0
-			} else if !req.WithContent && req.Limit > 0 {
-				fetchLimit = req.Limit + 1
-			}
-			messages, err := mail.NewClient().GetUnifiedMessagesJSON(req.Box, fetchLimit, fetchOffset,
-				req.WithContent, req.WithHeaders, req.Since)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "failed to read the %s view: %v", req.Box, err)
-			}
-			hasMore := false
-			if req.Query != "" {
-				messages = filterMessagesByQuery(messages, req.Query)
-				messages, hasMore = paginateMessages(messages, req.Offset, req.Limit)
-			} else if !req.WithContent && req.Limit > 0 && len(messages) > req.Limit {
-				hasMore = true
-				messages = messages[:req.Limit]
-			}
-			out := map[string]any{
-				"box": req.Box, "count": len(messages), "cached": false,
-				"messages": projectMessages(messages, req.Format),
-			}
-			if !req.WithContent || req.Query != "" {
-				out["hasMore"] = hasMore
-				if hasMore {
-					out["nextOffset"] = req.Offset + len(messages)
-				}
-			}
-			return out, nil
-		}
-		if req.Account == "" || req.Mailbox == "" {
-			return nil, errf(CodeInvalidRequest,
-				"messages.list: give box, or both account and mailbox")
-		}
+		account, mailbox := req.In.Account, req.In.Mailbox
 		cacheKey := fmt.Sprintf("msgs-%s-%s-%d-%d-%v-%v-%s-%s-%v-%v",
-			sanitizeCacheKey(req.Account), sanitizeCacheKey(req.Mailbox),
+			sanitizeCacheKey(account), sanitizeCacheKey(mailbox),
 			req.Limit, req.Offset, req.Unread, req.Flagged,
 			sanitizeCacheKey(req.Since), sanitizeCacheKey(req.Query), req.WithContent, req.WithHeaders)
 
@@ -329,6 +275,8 @@ func init() {
 		if !cached {
 			fetchLimit, fetchOffset := req.Limit, req.Offset
 			if req.Query != "" {
+				// Filter in Go after fetching metadata so offset/limit apply to
+				// the matched subset rather than before matching.
 				fetchLimit, fetchOffset = 0, 0
 			} else if !req.WithContent && req.Limit > 0 {
 				// Fetch one extra metadata row so we can report hasMore without
@@ -336,10 +284,10 @@ func init() {
 				// we never trigger an extra body download.
 				fetchLimit = req.Limit + 1
 			}
-			messages, err = mail.NewClient().GetMessagesJSON(req.Account, req.Mailbox,
+			messages, err = mail.NewClient().GetMessagesJSON(account, mailbox,
 				fetchLimit, fetchOffset, req.Unread, req.Flagged, req.WithContent, req.WithHeaders, req.Since)
 			if err != nil {
-				return nil, errf(CodeScriptFailed, "failed to list %s/%s: %v", req.Account, req.Mailbox, err)
+				return nil, errf(CodeScriptFailed, "failed to list %s/%s: %v", account, mailbox, err)
 			}
 			if req.Query != "" {
 				messages = filterMessagesByQuery(messages, req.Query)
@@ -354,9 +302,9 @@ func init() {
 			}
 		}
 		out := map[string]any{
-			"account": req.Account, "mailbox": req.Mailbox,
+			"account": account, "mailbox": mailbox,
 			"count": len(messages), "cached": cached,
-			"messages": projectMessages(messages, req.Format),
+			"messages": projectMessages(messages, req.WithContent || req.WithHeaders),
 		}
 		if !req.WithContent || req.Query != "" {
 			out["hasMore"] = hasMore
@@ -369,15 +317,12 @@ func init() {
 }
 
 type MessagesDigestParams struct {
-	Box     string `json:"box,omitempty" enum:"inbox|unread|flagged|sent|drafts|trash|junk" desc:"aggregate one cross-account view; mutually exclusive with account and mailbox"`
-	Account string `json:"account,omitempty" desc:"account name, e.g. \"Exchange\"; required together with mailbox unless box is given"`
-	Mailbox string `json:"mailbox,omitempty" desc:"mailbox name inside that account, e.g. \"收件箱\"; required together with account unless box is given"`
-	Unread  bool   `json:"unread,omitempty" desc:"only unread messages (account+mailbox form only)"`
-	Flagged bool   `json:"flagged,omitempty" desc:"only flagged messages"`
-	Since   string `json:"since,omitempty" desc:"only messages received at or after this date: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"`
-	Query   string `json:"query,omitempty" desc:"case-insensitive substring match on subject and sender before grouping"`
-	Limit   int    `json:"limit,omitempty" def:"200" desc:"maximum messages to scan for the digest"`
-	NoCache bool   `json:"noCache,omitempty" desc:"bypass the short-lived list cache"`
+	In      MailboxRef `json:"in" req:"1" desc:"the mailbox to summarize"`
+	Unread  bool       `json:"unread,omitempty" desc:"only unread messages"`
+	Flagged bool       `json:"flagged,omitempty" desc:"only flagged messages"`
+	Since   string     `json:"since,omitempty" desc:"only messages received at or after this date: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"`
+	Query   string     `json:"query,omitempty" desc:"case-insensitive substring match on subject and sender before grouping"`
+	Limit   int        `json:"limit,omitempty" def:"200" desc:"maximum messages to scan for the digest"`
 }
 
 type digestGroup struct {
@@ -451,50 +396,21 @@ func buildDigest(messages []mail.Message) []digestGroup {
 }
 
 func init() {
-	Register("messages.digest", "Group message metadata by sender for low-token triage and bulk quarantine", func(req MessagesDigestParams) (any, error) {
+	Register("messages.digest", "Group message metadata in one mailbox by sender for low-token triage and bulk quarantine", func(req MessagesDigestParams) (any, error) {
 		if req.Limit <= 0 {
 			req.Limit = defaultDigestLimit
 		}
-		var (
-			messages []mail.Message
-			err      error
-		)
-		if req.Box != "" {
-			if req.Account != "" || req.Mailbox != "" {
-				return nil, errf(CodeInvalidRequest,
-					"messages.digest: box cannot be combined with account or mailbox")
-			}
-			if req.Unread || req.Flagged || req.NoCache {
-				return nil, errf(CodeInvalidRequest,
-					"messages.digest: unread, flagged and noCache apply to account+mailbox only; a box view already filters and is never cached")
-			}
-			messages, err = mail.NewClient().GetUnifiedMessagesJSON(req.Box, req.Limit, 0, false, false, req.Since)
-			if err != nil {
-				return nil, errf(CodeScriptFailed, "failed to read the %s view: %v", req.Box, err)
-			}
-			messages = filterMessagesByQuery(messages, req.Query)
-			groups := buildDigest(messages)
-			return map[string]any{
-				"box":     req.Box,
-				"scanned": len(messages),
-				"groups":  len(groups),
-				"digest":  groups,
-			}, nil
-		}
-		if req.Account == "" || req.Mailbox == "" {
-			return nil, errf(CodeInvalidRequest,
-				"messages.digest: give box, or both account and mailbox")
-		}
-		messages, err = mail.NewClient().GetMessagesJSON(req.Account, req.Mailbox,
+		account, mailbox := req.In.Account, req.In.Mailbox
+		messages, err := mail.NewClient().GetMessagesJSON(account, mailbox,
 			req.Limit, 0, req.Unread, req.Flagged, false, false, req.Since)
 		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to list %s/%s: %v", req.Account, req.Mailbox, err)
+			return nil, errf(CodeScriptFailed, "failed to list %s/%s: %v", account, mailbox, err)
 		}
 		messages = filterMessagesByQuery(messages, req.Query)
 		groups := buildDigest(messages)
 		return map[string]any{
-			"account": req.Account,
-			"mailbox": req.Mailbox,
+			"account": account,
+			"mailbox": mailbox,
 			"scanned": len(messages),
 			"groups":  len(groups),
 			"digest":  groups,
@@ -503,25 +419,26 @@ func init() {
 }
 
 type MessagesShowParams struct {
-	Message MessageInMailbox `json:"message" req:"1"`
-	Body    string           `json:"body,omitempty" enum:"text|html|links" def:"text" desc:"text: Mail.app's rendered body, in which hyperlinks are already flattened to their anchor text. html: parse the raw message source and return its html, links and listUnsubscribe. links: the same parse without the html field, when all you need are the addresses."`
+	ID   string     `json:"id" req:"1" desc:"Mail.app message id"`
+	In   MailboxRef `json:"in" req:"1" desc:"the mailbox the message is currently in"`
+	Body string     `json:"body,omitempty" enum:"text|html|links" def:"text" desc:"text: Mail.app's rendered body, in which hyperlinks are already flattened to their anchor text. html: parse the raw message source and return its html, links and listUnsubscribe. links: the same parse without the html field, when all you need are the addresses."`
 }
 
 func init() {
 	Register("messages.show", "Show one message in full, including its body and thread headers. body:\"html\" or \"links\" recovers the hyperlinks and the List-Unsubscribe route that the rendered text loses", func(req MessagesShowParams) (any, error) {
 		client := mail.NewClient()
-		in := req.Message.In
+		in := req.In
 		// Asking for the source replaces the rendered-body read rather than
 		// adding to it, so either way the message is read once.
 		wantSource := req.Body == "html" || req.Body == "links"
 
-		message, err := client.GetMessageDetailsJSON(in.Account, in.Mailbox, req.Message.ID, !wantSource)
+		message, err := client.GetMessageDetailsJSON(in.Account, in.Mailbox, req.ID, !wantSource)
 		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to read message %s: %v", req.Message.ID, err)
+			return nil, errf(CodeScriptFailed, "failed to read message %s: %v", req.ID, err)
 		}
 		if message.ID == "" {
 			return nil, errf(CodeMessageMissing, "no message %s in %s/%s",
-				req.Message.ID, in.Account, in.Mailbox).
+				req.ID, in.Account, in.Mailbox).
 				withHint("re-list the mailbox first: mutations assign new ids")
 		}
 
@@ -530,13 +447,13 @@ func init() {
 			return data, nil
 		}
 
-		raw, err := client.GetMessageSource(in.Account, in.Mailbox, req.Message.ID)
+		raw, err := client.GetMessageSource(in.Account, in.Mailbox, req.ID)
 		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to read the raw source of %s: %v", req.Message.ID, err)
+			return nil, errf(CodeScriptFailed, "failed to read the raw source of %s: %v", req.ID, err)
 		}
 		parsed, perr := rawmail.Parse(raw)
 		if perr != nil {
-			return nil, errf(CodeScriptFailed, "could not parse the raw source of %s: %v", req.Message.ID, perr).
+			return nil, errf(CodeScriptFailed, "could not parse the raw source of %s: %v", req.ID, perr).
 				withHint(`the rendered body is still available with "body":"text"`)
 		}
 		// The text part comes out of the same parse, so it is always included;

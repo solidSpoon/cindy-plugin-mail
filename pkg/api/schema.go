@@ -157,8 +157,8 @@ func (b *builder) schema() Schema {
 				"no action sends mail: draft writes the message into Mail.app's Drafts mailbox for the user to review and send",
 				"no action deletes mail: messages.quarantine moves messages into a holding mailbox, which is reversible from Mail.app",
 				`every mutation accepts "dryRun": true, which reports what it would touch and changes nothing`,
-				"mutations take all ids in one call; with no \"in\" the ids are resolved globally, because Mail.app message ids are unique database-wide",
-				`reads accept "format": "compact" to drop fields that are empty for the query`,
+				`every messages.* action scopes to one mailbox via "in": {"account": "...", "mailbox": "..."}`,
+				"messages.list returns compact triage fields by default (8 fields per message); pass withContent/withHeaders when full fields are needed",
 			},
 			"input": []string{
 				"pass the request document as the first argument or on stdin",

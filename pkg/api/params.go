@@ -12,14 +12,6 @@ type MailboxRef struct {
 	Mailbox string `json:"mailbox" req:"1" desc:"mailbox name inside that account, e.g. \"收件箱\""`
 }
 
-// MessageInMailbox identifies a single message. Mail.app needs the mailbox the
-// message currently lives in; ids alone are only enough for the actions that
-// resolve them globally.
-type MessageInMailbox struct {
-	ID string     `json:"id" req:"1" desc:"Mail.app message id"`
-	In MailboxRef `json:"in" req:"1" desc:"the mailbox the message is currently in"`
-}
-
 // Recipients groups the address fields of a message. At least one To recipient
 // is required; Cc and Bcc are optional.
 type Recipients struct {

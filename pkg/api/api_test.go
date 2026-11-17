@@ -85,48 +85,32 @@ func TestSchemaNeverAdvertisesSendingOrDeleting(t *testing.T) {
 
 func TestSchemaSharesNestedTypesUnderDefs(t *testing.T) {
 	schema := schemaOf(t)
-	for _, want := range []string{"MailboxRef", "MessageInMailbox", "Recipients", "StateSet"} {
+	for _, want := range []string{"MailboxRef", "Recipients", "StateSet"} {
 		if _, ok := schema.Defs[want]; !ok {
 			t.Errorf("def %q is missing; shared parameter types should be described once", want)
 		}
+	}
+	if _, ok := schema.Defs["MessageInMailbox"]; ok {
+		t.Errorf("MessageInMailbox should have been removed in favor of flat id + in")
 	}
 	ref := schema.Defs["MailboxRef"]
 	if ref.Required == nil || len(ref.Required) != 2 {
 		t.Errorf("MailboxRef should require both fields, got %+v", ref)
 	}
-	// An action that takes a mailbox must point at the def rather than repeat
+	// Actions that take a mailbox must point at MailboxRef rather than repeat
 	// its fields.
-	var list ActionSpec
-	for _, a := range schema.Actions {
-		if a.Name == "messages.list" {
-			list = a
+	for _, name := range []string{"messages.list", "messages.digest", "messages.show", "messages.patch", "messages.move", "messages.quarantine"} {
+		var found ActionSpec
+		for _, a := range schema.Actions {
+			if a.Name == name {
+				found = a
+			}
 		}
-	}
-	props := list.Params["properties"].(map[string]any)
-	box := props["box"].(map[string]any)
-	if box["type"] != "string" {
-		t.Errorf("messages.list.box should be a string, got %+v", box)
-	}
-	if _, ok := box["enum"]; !ok {
-		t.Errorf("messages.list.box should carry its view enum, got %+v", box)
-	}
-	account := props["account"].(map[string]any)
-	if account["type"] != "string" {
-		t.Errorf("messages.list.account should be a string, got %+v", account)
-	}
-	if account["desc"] == "" {
-		t.Errorf("messages.list.account should carry its description")
-	}
-
-	var show ActionSpec
-	for _, a := range schema.Actions {
-		if a.Name == "messages.show" {
-			show = a
+		props := found.Params["properties"].(map[string]any)
+		in, ok := props["in"].(map[string]any)
+		if !ok || in["ref"] != "MailboxRef" {
+			t.Errorf("%s.in should reference MailboxRef, got %+v", name, props["in"])
 		}
-	}
-	message := show.Params["properties"].(map[string]any)["message"].(map[string]any)
-	if message["ref"] != "MessageInMailbox" {
-		t.Errorf("messages.show.message should reference MessageInMailbox, got %+v", message)
 	}
 }
 
@@ -162,45 +146,34 @@ func TestMissingParamsObjectIsReported(t *testing.T) {
 }
 
 func TestNestedRequiredFieldsAreNamed(t *testing.T) {
-	e := firstError(t, `{"action":"messages.show","params":{"message":{"id":"7847"}}}`)
+	e := firstError(t, `{"action":"messages.show","params":{"id":"7847","in":{"account":"A"}}}`)
 	if e.Code != CodeInvalidRequest {
 		t.Fatalf("code is %q, want %q", e.Code, CodeInvalidRequest)
 	}
-	if !strings.Contains(e.Message, "params.message.in") {
+	if !strings.Contains(e.Message, "params.in.mailbox") {
 		t.Errorf("error should give the nested path, got %q", e.Message)
 	}
 }
 
 func TestUnknownNestedParameterIsRejected(t *testing.T) {
-	e := firstError(t, `{"action":"messages.show","params":{"message":{"id":"1","in":{"account":"A","mailbox":"B","bogus":1}}}}`)
+	e := firstError(t, `{"action":"messages.show","params":{"id":"1","in":{"account":"A","mailbox":"B","bogus":1}}}`)
 	if !strings.Contains(e.Message, "bogus") {
 		t.Errorf("error should name the unknown field, got %q", e.Message)
 	}
 }
 
-func TestListTargetMustBeUnambiguous(t *testing.T) {
-	// A box view and a named mailbox are alternatives, not a combination.
-	e := firstError(t, `{"action":"messages.list","params":{"box":"unread","account":"Exchange","mailbox":"收件箱"}}`)
-	if !strings.Contains(e.Message, "cannot be combined") {
-		t.Errorf("box plus account/mailbox should be rejected, got %q", e.Message)
-	}
-
-	// The filters belong to the named-mailbox form; a view already filters.
-	e = firstError(t, `{"action":"messages.list","params":{"box":"unread","unread":true}}`)
-	if !strings.Contains(e.Message, "account+mailbox only") {
-		t.Errorf("unread with box should be rejected, got %q", e.Message)
-	}
-
-	e = firstError(t, `{"action":"messages.list","params":{"limit":5}}`)
-	if !strings.Contains(e.Message, "give box, or both account and mailbox") {
-		t.Errorf("neither target should be rejected, got %q", e.Message)
-	}
-}
-
-func TestBoxViewEnumIsValidated(t *testing.T) {
-	e := firstError(t, `{"action":"messages.list","params":{"box":"spam"}}`)
-	if !strings.Contains(e.Message, "inbox|unread|flagged|sent|drafts|trash|junk") {
-		t.Errorf("box should be validated against its enum, got %q", e.Message)
+func TestMessagesRequireInMailboxRef(t *testing.T) {
+	for _, doc := range []string{
+		`{"action":"messages.list","params":{"limit":5}}`,
+		`{"action":"messages.digest","params":{"limit":10}}`,
+		`{"action":"messages.patch","params":{"ids":["1"],"set":{"read":true}}}`,
+		`{"action":"messages.move","params":{"ids":["1"],"to":"Archive"}}`,
+		`{"action":"messages.quarantine","params":{"ids":["1"]}}`,
+	} {
+		e := firstError(t, doc)
+		if e.Code != CodeInvalidRequest || !strings.Contains(e.Message, "params.in") {
+			t.Errorf("%s: expected missing params.in error, got %+v", doc, e)
+		}
 	}
 }
 
@@ -208,7 +181,7 @@ func TestUnknownActionAndUnknownField(t *testing.T) {
 	if e := firstError(t, `{"action":"nope","params":{}}`); e.Code != CodeUnknownAction {
 		t.Errorf("code is %q, want %q", e.Code, CodeUnknownAction)
 	}
-	e := firstError(t, `{"action":"messages.list","params":{"account":"A","mailbox":"B","limt":5}}`)
+	e := firstError(t, `{"action":"messages.list","params":{"in":{"account":"A","mailbox":"B"},"limt":5}}`)
 	if e.Code != CodeInvalidRequest || !strings.Contains(e.Message, "limt") {
 		t.Errorf("misspelled parameter should fail by name, got %+v", e)
 	}
@@ -216,7 +189,7 @@ func TestUnknownActionAndUnknownField(t *testing.T) {
 
 func TestPatchRequiresSomethingToSet(t *testing.T) {
 	// The dryRun check comes after validation, so this never reaches Mail.app.
-	e := firstError(t, `{"action":"messages.patch","params":{"ids":["1"],"set":{}}}`)
+	e := firstError(t, `{"action":"messages.patch","params":{"ids":["1"],"in":{"account":"A","mailbox":"B"},"set":{}}}`)
 	if !strings.Contains(e.Message, "read and/or flagged") {
 		t.Errorf("empty set should be rejected, got %q", e.Message)
 	}
@@ -279,7 +252,7 @@ func TestCompactProjectionShape(t *testing.T) {
 	projected, err := json.Marshal(projectMessages([]mail.Message{
 		{ID: "1", Account: "A", Mailbox: "Inbox", DateReceived: "2026-01-01T00:00:00Z",
 			Sender: "s", Subject: "sub", Read: true, Flagged: true},
-	}, "compact"))
+	}, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +272,7 @@ func TestCompactProjectionShape(t *testing.T) {
 		t.Errorf("compact row has %d fields, want 8: %s", len(rows[0]), projected)
 	}
 
-	full := projectMessages([]mail.Message{{ID: "1", Content: "body"}}, "full")
+	full := projectMessages([]mail.Message{{ID: "1", Content: "body"}}, true)
 	raw, err := json.Marshal(full)
 	if err != nil {
 		t.Fatal(err)
@@ -349,13 +322,19 @@ func TestPartitionLocations(t *testing.T) {
 	}
 }
 
-func TestSchemaIncludesQuarantineMarkRead(t *testing.T) {
+func TestSchemaIncludesQuarantineToAndMarkRead(t *testing.T) {
 	schema := schemaOf(t)
 	for _, a := range schema.Actions {
 		if a.Name == "messages.quarantine" {
 			props := a.Params["properties"].(map[string]any)
 			if _, ok := props["markRead"]; !ok {
 				t.Errorf("messages.quarantine should expose markRead in schema")
+			}
+			if _, ok := props["to"]; !ok {
+				t.Errorf("messages.quarantine should expose to in schema")
+			}
+			if _, ok := props["box"]; ok {
+				t.Errorf("messages.quarantine should no longer expose box")
 			}
 			return
 		}
@@ -403,15 +382,18 @@ func TestBuildDigestGroupsAndSorts(t *testing.T) {
 	}
 }
 
-func TestDigestTargetValidation(t *testing.T) {
-	e := firstError(t, `{"action":"messages.digest","params":{"box":"inbox","account":"Google","mailbox":"INBOX"}}`)
-	if !strings.Contains(e.Message, "cannot be combined") {
-		t.Errorf("expected mutual exclusion error, got %q", e.Message)
+func TestDigestHasNoDeadNoCache(t *testing.T) {
+	schema := schemaOf(t)
+	for _, a := range schema.Actions {
+		if a.Name == "messages.digest" {
+			props := a.Params["properties"].(map[string]any)
+			if _, ok := props["noCache"]; ok {
+				t.Errorf("messages.digest should not expose unused noCache")
+			}
+			return
+		}
 	}
-	e = firstError(t, `{"action":"messages.digest","params":{"limit":10}}`)
-	if !strings.Contains(e.Message, "give box, or both account and mailbox") {
-		t.Errorf("expected missing target error, got %q", e.Message)
-	}
+	t.Fatal("messages.digest not found in schema")
 }
 
 func TestStillInSourceVerification(t *testing.T) {

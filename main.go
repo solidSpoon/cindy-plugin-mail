@@ -85,7 +85,7 @@ func helpDoc() any {
 		"version": version,
 		"usage": []string{
 			`mail-app-cli '{"action":"schema"}'`,
-			`mail-app-cli '{"action":"messages.list","params":{"box":"unread","limit":10,"format":"compact"}}'`,
+			`mail-app-cli '{"action":"messages.list","params":{"in":{"account":"Exchange","mailbox":"收件箱"},"unread":true}}'`,
 			`printf '%s' '{"ops":[...]}' | mail-app-cli`,
 		},
 		"input":       "one JSON request document, as the first argument or on stdin; an action plus its own params object, or an ops array of them",
