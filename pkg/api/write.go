@@ -7,17 +7,8 @@ import (
 	"github.com/intelligrit/mail-app-cli/pkg/mail"
 )
 
-// boolOr resolves an optional flag: absent means "leave it alone" at the call
-// site, and the caller passes the action's default.
-func boolOr(ptr *bool, def bool) bool {
-	if ptr == nil {
-		return def
-	}
-	return *ptr
-}
-
-// dryRunScoped answers "what would this touch?" without touching anything.
-func dryRunScoped(client *mail.Client, in MailboxRef, ids []string) ([]mail.MessageLocation, []string, error) {
+// resolveDryRun resolves ids and partitions them into existing and missing.
+func resolveDryRun(client *mail.Client, ids []string) ([]mail.MessageLocation, []string, error) {
 	locations, err := client.ResolveMessages(ids)
 	if err != nil {
 		return nil, nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
@@ -110,7 +101,7 @@ func init() {
 		}
 		client := mail.NewClient()
 		if req.DryRun {
-			wouldAffect, missing, err := dryRunScoped(client, req.In, req.IDs)
+			wouldAffect, missing, err := resolveDryRun(client, req.IDs)
 			if err != nil {
 				return nil, err
 			}
@@ -165,6 +156,64 @@ func init() {
 	})
 }
 
+type relocateOpts struct {
+	in       MailboxRef
+	ids      []string
+	to       string
+	verb     string
+	holding  bool
+	markRead bool
+	dryRun   bool
+	exec     func(client *mail.Client) (*mail.MutationResult, error)
+}
+
+func relocateMessages(opts relocateOpts) (any, error) {
+	client := mail.NewClient()
+	if opts.dryRun {
+		if e := checkDestMailbox(client, opts.in.Account, opts.to, opts.holding); e != nil {
+			return nil, e
+		}
+		wouldAffect, missing, err := resolveDryRun(client, opts.ids)
+		if err != nil {
+			return nil, err
+		}
+		out := map[string]any{
+			"dryRun":      true,
+			"in":          opts.in,
+			"to":          opts.to,
+			"wouldAffect": wouldAffect,
+			"missing":     missing,
+		}
+		if opts.markRead {
+			out["markRead"] = true
+		}
+		return out, nil
+	}
+	before, err := client.ResolveMessages(opts.ids)
+	if err != nil {
+		return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
+	}
+	if opts.markRead {
+		if _, err := client.MarkMessages(opts.in.Account, opts.in.Mailbox, opts.ids, true); err != nil {
+			return nil, errf(CodeScriptFailed, "mark read before quarantine failed: %v", err)
+		}
+	}
+	res, err := opts.exec(client)
+	if err != nil {
+		if opts.holding {
+			return nil, quarantineError(err)
+		}
+		return nil, errf(CodeScriptFailed, "move failed: %v", err)
+	}
+	data, partialErr := mutationData(res, opts.verb)
+	if m, ok := data.(map[string]any); ok && opts.markRead {
+		m["markedRead"] = true
+	}
+	report := confirmMoved(client, before, res.Succeeded, opts.to)
+	attachReport(data, report)
+	return data, combineMutationError(relocationError(report, opts.to), partialErr)
+}
+
 // ------------------------------------------------------------- messages.move
 
 type MessagesMoveParams struct {
@@ -176,35 +225,16 @@ type MessagesMoveParams struct {
 
 func init() {
 	Register("messages.move", "Move messages to another mailbox in the same account. The moved messages get new ids in the destination, and both source and destination are read back to confirm relocation", func(req MessagesMoveParams) (any, error) {
-		client := mail.NewClient()
-		if req.DryRun {
-			if e := checkDestMailbox(client, req.In.Account, req.To, false); e != nil {
-				return nil, e
-			}
-			wouldAffect, missing, err := dryRunScoped(client, req.In, req.IDs)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{
-				"dryRun":      true,
-				"in":          req.In,
-				"to":          req.To,
-				"wouldAffect": wouldAffect,
-				"missing":     missing,
-			}, nil
-		}
-		before, err := client.ResolveMessages(req.IDs)
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
-		}
-		res, err := client.MoveMessages(req.In.Account, req.In.Mailbox, req.IDs, req.To)
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "move failed: %v", err)
-		}
-		data, partialErr := mutationData(res, "moved to "+req.To)
-		report := confirmMoved(client, before, res.Succeeded, fixedDest(req.To))
-		attachReport(data, report)
-		return data, combineMutationError(relocationError(report, req.To), partialErr)
+		return relocateMessages(relocateOpts{
+			in:     req.In,
+			ids:    req.IDs,
+			to:     req.To,
+			verb:   "moved to " + req.To,
+			dryRun: req.DryRun,
+			exec: func(c *mail.Client) (*mail.MutationResult, error) {
+				return c.MoveMessages(req.In.Account, req.In.Mailbox, req.IDs, req.To)
+			},
+		})
 	})
 }
 
@@ -224,47 +254,18 @@ func init() {
 		if to == "" {
 			to = defaultQuarantineBox()
 		}
-		client := mail.NewClient()
-		if req.DryRun {
-			if e := checkDestMailbox(client, req.In.Account, to, true); e != nil {
-				return nil, e
-			}
-			wouldAffect, missing, err := dryRunScoped(client, req.In, req.IDs)
-			if err != nil {
-				return nil, err
-			}
-			out := map[string]any{
-				"dryRun":      true,
-				"in":          req.In,
-				"to":          to,
-				"wouldAffect": wouldAffect,
-				"missing":     missing,
-			}
-			if req.MarkRead {
-				out["markRead"] = true
-			}
-			return out, nil
-		}
-		before, err := client.ResolveMessages(req.IDs)
-		if err != nil {
-			return nil, errf(CodeScriptFailed, "failed to resolve ids: %v", err)
-		}
-		if req.MarkRead {
-			if _, err := client.MarkMessages(req.In.Account, req.In.Mailbox, req.IDs, true); err != nil {
-				return nil, errf(CodeScriptFailed, "mark read before quarantine failed: %v", err)
-			}
-		}
-		res, err := client.QuarantineMessagesIn(req.In.Account, req.In.Mailbox, to, req.IDs)
-		if err != nil {
-			return nil, quarantineError(err)
-		}
-		data, partialErr := mutationData(res, "quarantined in "+to)
-		if m, ok := data.(map[string]any); ok && req.MarkRead {
-			m["markedRead"] = true
-		}
-		report := confirmMoved(client, before, res.Succeeded, fixedDest(to))
-		attachReport(data, report)
-		return data, combineMutationError(relocationError(report, to), partialErr)
+		return relocateMessages(relocateOpts{
+			in:       req.In,
+			ids:      req.IDs,
+			to:       to,
+			verb:     "quarantined in " + to,
+			holding:  true,
+			markRead: req.MarkRead,
+			dryRun:   req.DryRun,
+			exec: func(c *mail.Client) (*mail.MutationResult, error) {
+				return c.QuarantineMessagesIn(req.In.Account, req.In.Mailbox, to, req.IDs)
+			},
+		})
 	})
 }
 

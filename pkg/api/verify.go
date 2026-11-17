@@ -39,18 +39,9 @@ func isAllMailMailbox(name string) bool {
 	}
 }
 
-// destResolver names the mailbox a relocation was aimed at, per account.
-type destResolver func(account string) (string, error)
-
-// fixedDest is the destination for move and quarantine: one mailbox name, looked
-// up inside each message's own account.
-func fixedDest(name string) destResolver {
-	return func(string) (string, error) { return name, nil }
-}
-
-// confirmMoved reads the destination of every affected account and reports which
-// of the handled ids are really there.
-func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []string, dest destResolver) *moveReport {
+// confirmMoved reads the destination (and source, except All Mail) of the
+// affected account and reports which handled ids arrived and left the source.
+func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []string, destMailbox string) *moveReport {
 	report := &moveReport{Verified: []string{}, Unverifiable: []string{}, Warnings: []string{}}
 	if len(handled) == 0 {
 		return report
@@ -90,22 +81,11 @@ func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []
 		}
 	}
 
-	destByAccount := map[string]string{}
 	for account, byMessageID := range expect {
-		mailbox, err := dest(account)
+		present, err := client.MailboxMessageIDs(account, destMailbox)
 		if err != nil {
 			report.Warnings = append(report.Warnings,
-				fmt.Sprintf("could not resolve the destination in %s, so the move was not confirmed: %v", account, err))
-			for _, ids := range byMessageID {
-				report.Unverifiable = append(report.Unverifiable, ids...)
-			}
-			continue
-		}
-		destByAccount[account] = mailbox
-		present, err := client.MailboxMessageIDs(account, mailbox)
-		if err != nil {
-			report.Warnings = append(report.Warnings,
-				fmt.Sprintf("could not read %s/%s back, so the move was not confirmed: %v", account, mailbox, err))
+				fmt.Sprintf("could not read %s/%s back, so the move was not confirmed: %v", account, destMailbox, err))
 			for _, ids := range byMessageID {
 				report.Unverifiable = append(report.Unverifiable, ids...)
 			}
@@ -128,7 +108,6 @@ func confirmMoved(client *mail.Client, before []mail.MessageLocation, handled []
 	// label-copy behavior where the destination receives a label while INBOX
 	// still retains the message).
 	for account, bySource := range sourceExpect {
-		destMailbox := destByAccount[account]
 		for sourceMailbox, byMessageID := range bySource {
 			if sourceMailbox == destMailbox {
 				continue
